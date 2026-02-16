@@ -18,7 +18,7 @@ import os
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import ProjectConfiguration, is_wandb_available, set_seed
-from datasets import DatasetDict, load_dataset
+from datasets import DatasetDict, load_dataset, load_from_disk
 from monotonic_align import maximum_path
 from tqdm.auto import tqdm
 
@@ -377,9 +377,8 @@ class DataCollatorTTSWithPadding:
         )["input_features"].transpose(1, 2)
 
         batch["mel_scaled_input_features"] = mel_scaled_input_features
-        batch["speaker_id"] = (
-            torch.tensor([feature["speaker_id"] for feature in features]) if "speaker_id" in features[0] else None
-        )
+        if "speaker_id" in features[0] and features[0]["speaker_id"] is not None:
+            batch["speaker_id"] = torch.tensor([feature["speaker_id"] for feature in features])
 
         return batch
 
@@ -587,23 +586,31 @@ def main():
     # 4. Load dataset
     raw_datasets = DatasetDict()
 
-    if training_args.do_train:
-        raw_datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.train_split_name,
-            cache_dir=model_args.cache_dir,
-            token=model_args.token,
-        )
+    if os.path.isdir(data_args.dataset_name):
+        # Load local dataset saved with save_to_disk
+        local_ds = load_from_disk(data_args.dataset_name)
+        if training_args.do_train:
+            raw_datasets["train"] = local_ds
+        if training_args.do_eval:
+            raw_datasets["eval"] = local_ds
+    else:
+        if training_args.do_train:
+            raw_datasets["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=data_args.train_split_name,
+                cache_dir=model_args.cache_dir,
+                token=model_args.token,
+            )
 
-    if training_args.do_eval:
-        raw_datasets["eval"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.eval_split_name,
-            cache_dir=model_args.cache_dir,
-            token=model_args.token,
-        )
+        if training_args.do_eval:
+            raw_datasets["eval"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=data_args.eval_split_name,
+                cache_dir=model_args.cache_dir,
+                token=model_args.token,
+            )
 
     if data_args.audio_column_name not in next(iter(raw_datasets.values())).column_names:
         raise ValueError(
@@ -1096,7 +1103,7 @@ def main():
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                     labels_attention_mask=batch["labels_attention_mask"],
-                    speaker_id=batch["speaker_id"],
+                    speaker_id=batch.get("speaker_id"),
                     return_dict=True,
                     monotonic_alignment_function=maximum_path,
                 )
@@ -1285,7 +1292,7 @@ def main():
                             attention_mask=batch["attention_mask"],
                             labels=batch["labels"],
                             labels_attention_mask=batch["labels_attention_mask"],
-                            speaker_id=batch["speaker_id"],
+                            speaker_id=batch.get("speaker_id"),
                             return_dict=True,
                             monotonic_alignment_function=maximum_path,
                         )
@@ -1387,7 +1394,7 @@ def main():
                         attention_mask=batch["attention_mask"],
                         labels=batch["labels"],
                         labels_attention_mask=batch["labels_attention_mask"],
-                        speaker_id=batch["speaker_id"],
+                        speaker_id=batch.get("speaker_id"),
                         return_dict=True,
                         monotonic_alignment_function=maximum_path,
                     )
@@ -1492,3 +1499,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
