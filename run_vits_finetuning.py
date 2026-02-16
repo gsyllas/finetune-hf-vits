@@ -557,7 +557,13 @@ def main():
             if remaining:
                 raise ValueError(f"Unknown command line arguments: {remaining}")
 
-            model_args, data_args, training_args = parser.parse_dict(vars(parsed_namespace))
+            # Filter out internal/computed attributes that TrainingArguments adds
+            namespace_dict = vars(parsed_namespace)
+            filtered_dict = {
+                k: v for k, v in namespace_dict.items()
+                if not k.startswith('_') and k not in {'deepspeed_plugin', 'distributed_state', 'fsdp_plugin'}
+            }
+            model_args, data_args, training_args = parser.parse_dict(filtered_dict)
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
