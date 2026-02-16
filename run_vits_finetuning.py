@@ -5,6 +5,7 @@ Fine-tuning Vits for TTS.
 import logging
 import math
 import os
+import json
 import shutil
 import sys
 import tempfile
@@ -14,7 +15,6 @@ from typing import Any, Dict, List, Optional, Union
 import datasets
 import numpy as np
 import torch
-import os
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import ProjectConfiguration, is_wandb_available, set_seed
@@ -587,12 +587,34 @@ def main():
     raw_datasets = DatasetDict()
 
     if os.path.isdir(data_args.dataset_name):
-        # Load local dataset saved with save_to_disk
+        # Load local dataset saved with save_to_disk.
         local_ds = load_from_disk(data_args.dataset_name)
-        if training_args.do_train:
-            raw_datasets["train"] = local_ds
-        if training_args.do_eval:
-            raw_datasets["eval"] = local_ds
+        if isinstance(local_ds, DatasetDict):
+            available_splits = list(local_ds.keys())
+            if training_args.do_train:
+                if data_args.train_split_name not in local_ds:
+                    raise ValueError(
+                        f"--train_split_name {data_args.train_split_name} not found in local dataset '{data_args.dataset_name}'. "
+                        f"Available splits: {available_splits}."
+                    )
+                raw_datasets["train"] = local_ds[data_args.train_split_name]
+            if training_args.do_eval:
+                if data_args.eval_split_name not in local_ds:
+                    raise ValueError(
+                        f"--eval_split_name {data_args.eval_split_name} not found in local dataset '{data_args.dataset_name}'. "
+                        f"Available splits: {available_splits}."
+                    )
+                raw_datasets["eval"] = local_ds[data_args.eval_split_name]
+        else:
+            if training_args.do_train:
+                raw_datasets["train"] = local_ds
+            if training_args.do_eval:
+                if data_args.eval_split_name != data_args.train_split_name:
+                    logger.warning(
+                        "Loaded a local `Dataset` at '%s' (single split). Using the same data for both train and eval.",
+                        data_args.dataset_name,
+                    )
+                raw_datasets["eval"] = local_ds
     else:
         if training_args.do_train:
             raw_datasets["train"] = load_dataset(
@@ -723,10 +745,20 @@ def main():
                     )
 
             with training_args.main_process_first(desc="get speaker id dict"):
-                speaker_id_dict = {
-                    speaker_id: i for (i, speaker_id) in enumerate(set(raw_datasets["train"][speaker_id_column_name]))
-                }
+                speaker_id_dict = {}
+                for speaker_id in raw_datasets["train"][speaker_id_column_name]:
+                    if speaker_id not in speaker_id_dict:
+                        speaker_id_dict[speaker_id] = len(speaker_id_dict)
                 new_num_speakers = len(speaker_id_dict)
+                if training_args.do_eval and "eval" in raw_datasets:
+                    eval_speaker_ids = set(raw_datasets["eval"][speaker_id_column_name])
+                    unseen_eval_speaker_ids = [speaker_id for speaker_id in eval_speaker_ids if speaker_id not in speaker_id_dict]
+                    if unseen_eval_speaker_ids:
+                        logger.warning(
+                            "Found %s speaker ids in eval split that are missing from train split. "
+                            "They will default to speaker_id=0 during preprocessing.",
+                            len(unseen_eval_speaker_ids),
+                        )
 
     def prepare_dataset(batch):
         # process target audio
@@ -853,6 +885,19 @@ def main():
             feature_extractor.save_pretrained(training_args.output_dir)
             tokenizer.save_pretrained(training_args.output_dir)
             config.save_pretrained(training_args.output_dir)
+            if speaker_id_dict:
+                speaker_id_mapping_path = os.path.join(training_args.output_dir, "speaker_id_mapping.json")
+                with open(speaker_id_mapping_path, "w", encoding="utf-8") as speaker_mapping_file:
+                    json.dump(
+                        {
+                            "speaker_id_column_name": speaker_id_column_name,
+                            "num_speakers": new_num_speakers,
+                            "mapping": {str(speaker_id): mapped_id for speaker_id, mapped_id in speaker_id_dict.items()},
+                        },
+                        speaker_mapping_file,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
 
     # 10. Define data collator
     data_collator = DataCollatorTTSWithPadding(
@@ -1499,4 +1544,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
