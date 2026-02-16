@@ -2,6 +2,7 @@
 Fine-tuning Vits for TTS.
 """
 
+import argparse
 import logging
 import math
 import os
@@ -527,10 +528,36 @@ def main():
     # We now keep distinct sets of args, for a cleaner separation of concerns.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, VITSTrainingArguments))
 
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
+    if len(sys.argv) >= 2 and sys.argv[1].endswith(".json"):
+        # If we pass a JSON config first, load it and optionally override fields
+        # with extra CLI args that follow.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+
+        if len(sys.argv) > 2:
+            merged_args = {}
+            merged_args.update(vars(model_args))
+            merged_args.update(vars(data_args))
+            merged_args.update(vars(training_args))
+            namespace = argparse.Namespace(**merged_args)
+
+            # Required args are already provided by the JSON, so disable them
+            # while parsing overrides-only CLI arguments.
+            required_actions = []
+            for action in parser._actions:
+                if action.required:
+                    required_actions.append(action)
+                    action.required = False
+
+            try:
+                parsed_namespace, remaining = parser.parse_known_args(args=sys.argv[2:], namespace=namespace)
+            finally:
+                for action in required_actions:
+                    action.required = True
+
+            if remaining:
+                raise ValueError(f"Unknown command line arguments: {remaining}")
+
+            model_args, data_args, training_args = parser.parse_dict(vars(parsed_namespace))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
