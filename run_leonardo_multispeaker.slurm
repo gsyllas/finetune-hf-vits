@@ -20,13 +20,6 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
 
-echo "Copying multispeaker dataset and model to local SSD..."
-cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/greek_multispeaker_vits $TMPDIR/greek_multispeaker_vits
-cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/models/mms-tts-ell-train $TMPDIR/mms-tts-ell-train
-echo "Copy done."
-
 cd /leonardo_work/EUHPC_D29_081/gsyllas0/finetune-hf-vits
 
-accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek_multispeaker.json \
-    --dataset_name $TMPDIR/greek_multispeaker_vits \
-    --model_name_or_path $TMPDIR/mms-tts-ell-train
+accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek_multispeaker.json

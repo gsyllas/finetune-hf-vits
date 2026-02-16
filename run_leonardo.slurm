@@ -23,12 +23,6 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
 
-# Copy dataset and model to fast local storage
-echo "Copying data to local SSD..."
-cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/female_vits $TMPDIR/female_vits
-cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/models/mms-tts-ell-train $TMPDIR/mms-tts-ell-train
-echo "Copy done."
-
 # Go to project directory
 cd /leonardo_work/EUHPC_D29_081/gsyllas0/finetune-hf-vits
 
