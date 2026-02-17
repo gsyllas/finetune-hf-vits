@@ -1108,12 +1108,14 @@ def main():
     else:
         gen_param_groups = [{"params": list(model.parameters()), "lr": training_args.learning_rate}]
 
-    # If freeze_backbone_epochs > 0, freeze backbone initially
+    # If freeze_backbone_epochs > 0, set backbone LR to 0 initially.
+    # We use lr=0 instead of requires_grad=False to stay compatible with
+    # fp16 GradScaler (which asserts that inf checks exist for all param groups).
     freeze_backbone_epochs = training_args.freeze_backbone_epochs if has_speaker_params else 0
+    backbone_lr_actual = training_args.learning_rate
     if freeze_backbone_epochs > 0:
-        logger.info("Freezing backbone for the first %d epochs (only speaker layers train).", freeze_backbone_epochs)
-        for param in backbone_params:
-            param.requires_grad = False
+        logger.info("Freezing backbone for the first %d epochs (backbone lr=0, only speaker layers update).", freeze_backbone_epochs)
+        gen_param_groups[0]["lr"] = 0.0
 
     gen_optimizer = torch.optim.AdamW(
         gen_param_groups,
@@ -1236,11 +1238,10 @@ def main():
 
     backbone_unfrozen = freeze_backbone_epochs == 0
     for epoch in range(first_epoch, training_args.num_train_epochs):
-        # Unfreeze backbone after freeze_backbone_epochs
+        # Unfreeze backbone after freeze_backbone_epochs by restoring its LR
         if not backbone_unfrozen and epoch >= freeze_backbone_epochs:
-            logger.info("Epoch %d: unfreezing backbone parameters for joint training.", epoch)
-            for param in backbone_params:
-                param.requires_grad = True
+            logger.info("Epoch %d: unfreezing backbone (lr=0 -> %.2e) for joint training.", epoch, backbone_lr_actual)
+            gen_optimizer.param_groups[0]["lr"] = backbone_lr_actual
             backbone_unfrozen = True
 
         # keep track of train losses
