@@ -42,7 +42,7 @@ if is_wandb_available():
     import wandb
 
 
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 logger = logging.getLogger(__name__)
 
 
