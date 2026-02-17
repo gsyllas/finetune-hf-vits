@@ -152,6 +152,28 @@ class VITSTrainingArguments(TrainingArguments):
 
     weight_fmaps: float = field(default=1.0, metadata={"help": "Feature map loss weight"})
 
+    freeze_backbone_epochs: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of initial epochs where backbone (pretrained) parameters are frozen and only speaker "
+                "conditioning layers are trained. Set to 0 to disable two-stage training. "
+                "Only relevant for multispeaker training with override_speaker_embeddings=True."
+            )
+        },
+    )
+
+    speaker_learning_rate: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Learning rate for speaker conditioning layers (embed_speaker and all .cond layers). "
+                "When set, these randomly-initialized layers train faster than the pretrained backbone. "
+                "Only relevant for multispeaker training. If None, uses the same learning_rate for all parameters."
+            )
+        },
+    )
+
 
 @dataclass
 class DataTrainingArguments:
@@ -447,6 +469,7 @@ def log_on_trackers(
     full_generation_waveform,
     epoch,
     sampling_rate,
+    speaker_id_mapping=None,
 ):
     max_num_samples = min(len(generated_audio), 50)
     generated_audio = generated_audio[:max_num_samples]
@@ -469,6 +492,22 @@ def log_on_trackers(
             tracker.writer.add_images("target spectrogram", np.stack(target_spec), dataformats="NHWC")
         elif tracker.name == "wandb":
             # wandb can only loads 100 audios per step
+
+            # Create speaker-aware captions for full generation samples
+            full_gen_audios = []
+            for idx, w in enumerate(full_generation_waveform):
+                if speaker_id_mapping and len(full_generation_waveform) > 1:
+                    # Multispeaker: use speaker names if available
+                    speaker_name = None
+                    for name, mapped_id in speaker_id_mapping.items():
+                        if mapped_id == idx:
+                            speaker_name = name
+                            break
+                    caption = f"Speaker {idx} ({speaker_name}) - epoch {epoch}" if speaker_name else f"Speaker {idx} - epoch {epoch}"
+                else:
+                    caption = f"Full generation sample epoch {epoch}"
+                full_gen_audios.append(wandb.Audio(w, caption=caption, sample_rate=sampling_rate))
+
             tracker.log(
                 {
                     "alignments": [wandb.Image(attn, caption=f"Audio epoch {epoch}") for attn in generated_attn],
@@ -482,10 +521,7 @@ def log_on_trackers(
                         )
                         for audio in generated_audio
                     ],
-                    "full generations samples": [
-                        wandb.Audio(w, caption=f"Full generation sample {epoch}", sample_rate=sampling_rate)
-                        for w in full_generation_waveform
-                    ],
+                    "full generations samples": full_gen_audios,
                 }
             )
         else:
@@ -1044,9 +1080,43 @@ def main():
     del model.discriminator
 
     # init gen_optimizer, gen_lr_scheduler, disc_optimizer, dics_lr_scheduler
+    #
+    # For multispeaker training, separate speaker conditioning layers from the
+    # pretrained backbone so they can use a higher learning rate and/or be the
+    # only trainable parameters during the freeze_backbone_epochs stage.
+    speaker_cond_keywords = {"embed_speaker", ".cond."}
+    speaker_params = []
+    backbone_params = []
+    for name, param in model.named_parameters():
+        if any(kw in name for kw in speaker_cond_keywords):
+            speaker_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    speaker_lr = training_args.speaker_learning_rate if training_args.speaker_learning_rate else training_args.learning_rate
+    has_speaker_params = len(speaker_params) > 0 and new_num_speakers > 1
+
+    if has_speaker_params:
+        logger.info(
+            "Multispeaker optimizer: %d speaker params (lr=%.2e), %d backbone params (lr=%.2e)",
+            len(speaker_params), speaker_lr, len(backbone_params), training_args.learning_rate,
+        )
+        gen_param_groups = [
+            {"params": backbone_params, "lr": training_args.learning_rate},
+            {"params": speaker_params, "lr": speaker_lr},
+        ]
+    else:
+        gen_param_groups = [{"params": list(model.parameters()), "lr": training_args.learning_rate}]
+
+    # If freeze_backbone_epochs > 0, freeze backbone initially
+    freeze_backbone_epochs = training_args.freeze_backbone_epochs if has_speaker_params else 0
+    if freeze_backbone_epochs > 0:
+        logger.info("Freezing backbone for the first %d epochs (only speaker layers train).", freeze_backbone_epochs)
+        for param in backbone_params:
+            param.requires_grad = False
+
     gen_optimizer = torch.optim.AdamW(
-        model.parameters(),
-        training_args.learning_rate,
+        gen_param_groups,
         betas=[training_args.adam_beta1, training_args.adam_beta2],
         eps=training_args.adam_epsilon,
     )
@@ -1164,7 +1234,15 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    backbone_unfrozen = freeze_backbone_epochs == 0
     for epoch in range(first_epoch, training_args.num_train_epochs):
+        # Unfreeze backbone after freeze_backbone_epochs
+        if not backbone_unfrozen and epoch >= freeze_backbone_epochs:
+            logger.info("Epoch %d: unfreezing backbone parameters for joint training.", epoch)
+            for param in backbone_params:
+                param.requires_grad = True
+            backbone_unfrozen = True
+
         # keep track of train losses
         train_losses = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
@@ -1441,6 +1519,7 @@ def main():
                         full_generation_waveform,
                         epoch,
                         sampling_rate,
+                        speaker_id_mapping=speaker_id_dict if speaker_id_dict else None,
                     )
 
                     logger.info("Validation finished... ")
@@ -1539,6 +1618,7 @@ def main():
                     full_generation_waveform,
                     epoch,
                     sampling_rate,
+                    speaker_id_mapping=speaker_id_dict if speaker_id_dict else None,
                 )
 
                 accelerator.log(val_losses, step=global_step)
