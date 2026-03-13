@@ -1760,7 +1760,7 @@ class VitsModel(VitsPreTrainedModel):
 
             if not ((0 <= speaker_id).all() and (speaker_id < self.config.num_speakers).all()).item():
                 raise ValueError(f"Set `speaker_id` in the range 0-{self.config.num_speakers - 1}.")
-            if not (len(speaker_id) == 1 or len(speaker_id == len(input_ids))):
+            if not (len(speaker_id) == 1 or len(speaker_id) == len(input_ids)):
                 raise ValueError(
                     f"You passed {len(speaker_id)} `speaker_id` but you should either pass one speaker id or `batch_size` `speaker_id`."
                 )
@@ -2137,7 +2137,7 @@ class VitsModelForPreTraining(VitsPreTrainedModel):
 
             if not ((0 <= speaker_id).all() and (speaker_id < self.config.num_speakers).all()).item():
                 raise ValueError(f"Set `speaker_id` in the range 0-{self.config.num_speakers - 1}.")
-            if not (len(speaker_id) == 1 or len(speaker_id == len(input_ids))):
+            if not (len(speaker_id) == 1 or len(speaker_id) == len(input_ids)):
                 raise ValueError(
                     f"You passed {len(speaker_id)} `speaker_id` but you should either pass one speaker id or `batch_size` `speaker_id`."
                 )

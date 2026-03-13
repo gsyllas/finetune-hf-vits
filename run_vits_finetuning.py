@@ -927,18 +927,14 @@ def main():
 
         # override speaker embeddings if necessary
         if model_args.override_speaker_embeddings and data_args.speaker_id_column_name is not None:
-            if new_num_speakers != num_speakers and new_num_speakers > 1:
+            if new_num_speakers > 1:
                 speaker_embedding_size = config.speaker_embedding_size if config.speaker_embedding_size > 1 else 256
                 logger.info(
-                    f"Resize speaker emeddings from {num_speakers} to {new_num_speakers} with embedding size {speaker_embedding_size}."
+                    f"Reinitializing speaker embeddings: {num_speakers} -> {new_num_speakers} speakers, embedding size {speaker_embedding_size}."
                 )
                 model.resize_speaker_embeddings(new_num_speakers, speaker_embedding_size)
             elif new_num_speakers == 1:
                 logger.info("Only one speaker detected on the training set. Embeddings are not reinitialized.")
-            else:
-                logger.info(
-                    "Same number of speakers on the new dataset than on the model. Embeddings are not reinitialized."
-                )
 
         # override token embeddings if necessary
         if model_args.override_vocabulary_embeddings:
@@ -1084,7 +1080,7 @@ def main():
     # For multispeaker training, separate speaker conditioning layers from the
     # pretrained backbone so they can use a higher learning rate and/or be the
     # only trainable parameters during the freeze_backbone_epochs stage.
-    speaker_cond_keywords = {"embed_speaker", ".cond."}
+    speaker_cond_keywords = {"embed_speaker", ".cond.", "cond_layer"}
     speaker_params = []
     backbone_params = []
     for name, param in model.named_parameters():
@@ -1113,10 +1109,9 @@ def main():
     # fp16 GradScaler (which asserts that inf checks exist for all param groups).
     freeze_backbone_epochs = training_args.freeze_backbone_epochs if has_speaker_params else 0
     backbone_lr_actual = training_args.learning_rate
-    if freeze_backbone_epochs > 0:
-        logger.info("Freezing backbone for the first %d epochs (backbone lr=0, only speaker layers update).", freeze_backbone_epochs)
-        gen_param_groups[0]["lr"] = 0.0
 
+    # Create optimizer with the real backbone LR so schedulers record the
+    # correct base_lrs.  We override to 0.0 *after* scheduler creation.
     gen_optimizer = torch.optim.AdamW(
         gen_param_groups,
         betas=[training_args.adam_beta1, training_args.adam_beta2],
@@ -1161,6 +1156,12 @@ def main():
             num_warmup_steps=num_warmups_steps if num_warmups_steps > 0 else None,
             num_training_steps=num_training_steps,
         )
+
+    # Now freeze backbone by setting lr=0 after schedulers have stored
+    # the correct base_lrs, so unfreeze + scheduler.step() works properly.
+    if freeze_backbone_epochs > 0:
+        logger.info("Freezing backbone for the first %d epochs (backbone lr=0, only speaker layers update).", freeze_backbone_epochs)
+        gen_optimizer.param_groups[0]["lr"] = 0.0
 
     # Prepare everything with our `accelerator`.
     (
@@ -1240,9 +1241,15 @@ def main():
     for epoch in range(first_epoch, training_args.num_train_epochs):
         # Unfreeze backbone after freeze_backbone_epochs by restoring its LR
         if not backbone_unfrozen and epoch >= freeze_backbone_epochs:
-            logger.info("Epoch %d: unfreezing backbone (lr=0 -> %.2e) for joint training.", epoch, backbone_lr_actual)
-            gen_optimizer.param_groups[0]["lr"] = backbone_lr_actual
             backbone_unfrozen = True
+            # Stop overriding lr=0.  The scheduler already has the correct
+            # base_lrs so the next scheduler.step() will set the right value.
+            # For the per-epoch ExponentialLR case the step below handles it;
+            # for the per-step scheduler case, restore the lr from the
+            # scheduler's base_lrs so training resumes at the correct rate.
+            if not training_args.do_step_schedule_per_epoch:
+                gen_optimizer.param_groups[0]["lr"] = gen_lr_scheduler.base_lrs[0]
+            logger.info("Epoch %d: unfreezing backbone for joint training.", epoch)
 
         # keep track of train losses
         train_losses = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -1250,6 +1257,9 @@ def main():
         if training_args.do_step_schedule_per_epoch:
             disc_lr_scheduler.step()
             gen_lr_scheduler.step()
+            # During freeze, override backbone lr back to 0 after scheduler step
+            if not backbone_unfrozen:
+                gen_optimizer.param_groups[0]["lr"] = 0.0
 
         for step, batch in enumerate(train_dataloader):
             # print(f"batch {step}, process{accelerator.process_index}, waveform {(batch['waveform'].shape)}, tokens {(batch['input_ids'].shape)}... ")
@@ -1330,6 +1340,8 @@ def main():
                 gen_optimizer.step()
                 if not training_args.do_step_schedule_per_epoch:
                     gen_lr_scheduler.step()
+                    if not backbone_unfrozen:
+                        gen_optimizer.param_groups[0]["lr"] = 0.0
                 gen_optimizer.zero_grad()
 
                 # update and gather losses
