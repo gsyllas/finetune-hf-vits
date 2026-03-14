@@ -1502,10 +1502,10 @@ def main():
                             if num_speakers < 2:
                                 full_generation_waveform = model(**full_generation_sample.to(model.device), speaker_id=None).waveform.cpu().numpy()
                             else:
-                                full_generation_waveform = np.concatenate([
-                                    model(**full_generation_sample.to(model.device), speaker_id=sid).waveform.cpu().numpy()
+                                full_generation_waveform = [
+                                    model(**full_generation_sample.to(model.device), speaker_id=sid).waveform.cpu().numpy()[0]
                                     for sid in range(min(5, num_speakers))
-                                ], axis=0)
+                                ]
 
                         generated_audio.append(generated_train_waveform.cpu())
                         generated_attn.append(padded_attn.cpu())
@@ -1607,10 +1607,10 @@ def main():
                         if num_speakers < 2:
                             full_generation_waveform = model(**full_generation_sample.to(model.device), speaker_id=None).waveform.cpu().numpy()
                         else:
-                            full_generation_waveform = np.concatenate([
-                                model(**full_generation_sample.to(model.device), speaker_id=sid).waveform.cpu().numpy()
+                            full_generation_waveform = [
+                                model(**full_generation_sample.to(model.device), speaker_id=sid).waveform.cpu().numpy()[0]
                                 for sid in range(min(5, num_speakers))
-                            ], axis=0)
+                            ]
 
                     generated_audio.append(generated_train_waveform.cpu())
                     generated_attn.append(padded_attn.cpu())
