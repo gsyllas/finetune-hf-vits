@@ -1499,8 +1499,13 @@ def main():
 
                     if accelerator.is_main_process:
                         with torch.no_grad():
-                            speaker_id = None if num_speakers < 2 else list(range(min(5, num_speakers)))
-                            full_generation = model(**full_generation_sample.to(model.device), speaker_id=speaker_id)
+                            if num_speakers < 2:
+                                full_generation_waveform = model(**full_generation_sample.to(model.device), speaker_id=None).waveform.cpu().numpy()
+                            else:
+                                full_generation_waveform = np.concatenate([
+                                    model(**full_generation_sample.to(model.device), speaker_id=sid).waveform.cpu().numpy()
+                                    for sid in range(min(5, num_speakers))
+                                ], axis=0)
 
                         generated_audio.append(generated_train_waveform.cpu())
                         generated_attn.append(padded_attn.cpu())
@@ -1519,7 +1524,6 @@ def main():
                     target_spec = [
                         plot_spectrogram_to_numpy(attn.numpy()) for attn_batch in target_spec for attn in attn_batch
                     ]
-                    full_generation_waveform = full_generation.waveform.cpu().numpy()
 
                     accelerator.log(val_losses, step=global_step)
 
@@ -1600,8 +1604,13 @@ def main():
 
                 if accelerator.is_main_process:
                     with torch.no_grad():
-                        speaker_id = None if num_speakers < 2 else list(range(min(5, num_speakers)))
-                        full_generation = model(**full_generation_sample.to(model.device), speaker_id=speaker_id)
+                        if num_speakers < 2:
+                            full_generation_waveform = model(**full_generation_sample.to(model.device), speaker_id=None).waveform.cpu().numpy()
+                        else:
+                            full_generation_waveform = np.concatenate([
+                                model(**full_generation_sample.to(model.device), speaker_id=sid).waveform.cpu().numpy()
+                                for sid in range(min(5, num_speakers))
+                            ], axis=0)
 
                     generated_audio.append(generated_train_waveform.cpu())
                     generated_attn.append(padded_attn.cpu())
@@ -1620,7 +1629,6 @@ def main():
                 target_spec = [
                     plot_spectrogram_to_numpy(attn.numpy()) for attn_batch in target_spec for attn in attn_batch
                 ]
-                full_generation_waveform = full_generation.waveform.cpu().numpy()
 
                 log_on_trackers(
                     accelerator.trackers,
