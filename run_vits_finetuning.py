@@ -1262,7 +1262,7 @@ def main():
                 gen_optimizer.param_groups[0]["lr"] = 0.0
 
         for step, batch in enumerate(train_dataloader):
-            # print(f"batch {step}, process{accelerator.process_index}, waveform {(batch['waveform'].shape)}, tokens {(batch['input_ids'].shape)}... ")
+            print(f"batch {step}, process{accelerator.process_index}, waveform {(batch['waveform'].shape)}, tokens {(batch['input_ids'].shape)}... ")
             with accelerator.accumulate(model, discriminator):
                 # forward through model
                 model_outputs = model(

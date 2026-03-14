@@ -23,7 +23,7 @@
     "model_name_or_path": "/leonardo_work/EUHPC_D29_081/gsyllas0/models/mms-tts-ell-train",
 
     "preprocessing_num_workers": 4,
-    "dataloader_num_workers": 4,
+    "dataloader_num_workers": 0,
 
     "do_train": true,
     "num_train_epochs": 20,
