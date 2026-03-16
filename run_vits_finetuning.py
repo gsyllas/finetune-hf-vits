@@ -1527,6 +1527,18 @@ def main():
 
                     accelerator.log(val_losses, step=global_step)
 
+                    if num_speakers >= 2:
+                        with torch.no_grad():
+                            emb = accelerator.unwrap_model(model).embed_speaker.weight
+                            spk_sim = torch.nn.functional.cosine_similarity(
+                                emb[0:1], emb[1:2], dim=1
+                            ).item()
+                        logger.info(
+                            f"Speaker embedding cosine similarity (spk0 vs spk1): {spk_sim:.4f}"
+                            f" {'<-- COLLAPSE WARNING' if spk_sim > 0.95 else ''}"
+                        )
+                        accelerator.log({"speaker_embedding_cosine_similarity": spk_sim}, step=global_step)
+
                     log_on_trackers(
                         accelerator.trackers,
                         generated_audio,
@@ -1643,6 +1655,19 @@ def main():
                 )
 
                 accelerator.log(val_losses, step=global_step)
+
+                if num_speakers >= 2:
+                    with torch.no_grad():
+                        emb = accelerator.unwrap_model(model).embed_speaker.weight
+                        spk_sim = torch.nn.functional.cosine_similarity(
+                            emb[0:1], emb[1:2], dim=1
+                        ).item()
+                    logger.info(
+                        f"Speaker embedding cosine similarity (spk0 vs spk1): {spk_sim:.4f}"
+                        f" {'<-- COLLAPSE WARNING' if spk_sim > 0.95 else ''}"
+                    )
+                    accelerator.log({"speaker_embedding_cosine_similarity": spk_sim}, step=global_step)
+
                 logger.info("Validation finished... ")
 
             accelerator.wait_for_everyone()

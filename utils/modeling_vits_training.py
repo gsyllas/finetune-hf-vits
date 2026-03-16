@@ -609,14 +609,11 @@ class VitsPosteriorEncoder(nn.Module):
         num_layers = self.wavenet.num_layers
 
         cond_layer = torch.nn.Conv1d(speaker_embedding_size, 2 * hidden_size * num_layers, 1)
+        nn.init.kaiming_normal_(cond_layer.weight)
+        if cond_layer.bias is not None:
+            k = math.sqrt(cond_layer.groups / (cond_layer.in_channels * cond_layer.kernel_size[0]))
+            nn.init.uniform_(cond_layer.bias, a=-k, b=k)
         self.wavenet.cond_layer = nn.utils.weight_norm(cond_layer, name="weight")
-        nn.init.kaiming_normal_(self.wavenet.cond_layer.weight)
-        if self.wavenet.cond_layer.bias is not None:
-            k = math.sqrt(
-                self.wavenet.cond_layer.groups
-                / (self.wavenet.cond_layer.in_channels * self.wavenet.cond_layer.kernel_size[0])
-            )
-            nn.init.uniform_(self.wavenet.cond_layer.bias, a=-k, b=k)
 
 
 class VitsHifiGanDiscriminatorScaleResidualBlock(nn.Module):
@@ -944,6 +941,10 @@ class VitsResidualCouplingBlock(nn.Module):
             num_layers = flow.wavenet.num_layers
 
             cond_layer = torch.nn.Conv1d(speaker_embedding_size, 2 * hidden_size * num_layers, 1)
+            nn.init.kaiming_normal_(cond_layer.weight)
+            if cond_layer.bias is not None:
+                k = math.sqrt(cond_layer.groups / (cond_layer.in_channels * cond_layer.kernel_size[0]))
+                nn.init.uniform_(cond_layer.bias, a=-k, b=k)
             flow.wavenet.cond_layer = nn.utils.weight_norm(cond_layer, name="weight")
 
 
@@ -1949,10 +1950,11 @@ class VitsModelForPreTraining(VitsPreTrainedModel):
         self.embed_speaker = new_embeddings
 
         # then take care of sub-models
+        # flow and posterior_encoder use weight_norm on cond_layer, so init happens
+        # inside their resize methods before weight_norm is applied.
         self.flow.resize_speaker_embeddings(speaker_embedding_size)
-        for flow in self.flow.flows:
-            self._init_weights(flow.wavenet.cond_layer)
 
+        # decoder.cond and duration_predictor.cond are plain Conv1d — _init_weights works fine.
         self.decoder.resize_speaker_embedding(speaker_embedding_size)
         self._init_weights(self.decoder.cond)
 
@@ -1960,7 +1962,6 @@ class VitsModelForPreTraining(VitsPreTrainedModel):
         self._init_weights(self.duration_predictor.cond)
 
         self.posterior_encoder.resize_speaker_embeddings(speaker_embedding_size)
-        self._init_weights(self.posterior_encoder.wavenet.cond_layer)
 
         self.config.num_speakers = new_num_speakers
         self.config.speaker_embedding_size = speaker_embedding_size

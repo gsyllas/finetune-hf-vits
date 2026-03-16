@@ -22,5 +22,4 @@ export WANDB_MODE=offline
 
 cd /leonardo_work/EUHPC_D29_081/gsyllas0/finetune-hf-vits
 
-accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek_multispeaker.json \
-  --resume_from_checkpoint="/leonardo_work/EUHPC_D29_081/gsyllas0/output/vits_finetuned_greek_multispeaker/checkpoint-15000"
+accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek_multispeaker.json
