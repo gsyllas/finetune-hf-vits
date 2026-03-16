@@ -55,8 +55,15 @@ class ModelArguments:
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
 
-    model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to pretrained model or model identifier from huggingface.co/models. "
+                "When `from_scratch=True`, this can be reused as the default source for config/tokenizer/"
+                "feature-extractor artifacts."
+            )
+        },
     )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
@@ -101,6 +108,16 @@ class ModelArguments:
                 "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option"
                 "should only be set to `True` for repositories you trust and in which you have read the code, as it will"
                 "execute code present on the Hub on your local machine."
+            )
+        },
+    )
+    from_scratch: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If `True`, initialize model weights randomly instead of loading checkpoint weights. "
+                "You still need config/tokenizer/feature extractor artifacts via `config_name`, "
+                "`tokenizer_name`, `feature_extractor_name`, or `model_name_or_path`."
             )
         },
     )
@@ -415,6 +432,46 @@ def load_min_speaker_hours_filter(
     return {speaker_id for speaker_id, _, _ in kept_speakers}, resolved_stats_path, kept_speakers
 
 
+def resolve_artifact_source(
+    explicit_source: Optional[str],
+    fallback_source: Optional[str],
+    artifact_name: str,
+) -> str:
+    source = explicit_source if explicit_source is not None else fallback_source
+    if source is None:
+        raise ValueError(
+            f"`{artifact_name}` could not be resolved. Pass `--{artifact_name}` explicitly or set "
+            "`--model_name_or_path` so it can act as the default artifact source."
+        )
+    return source
+
+
+def validate_multispeaker_setup(
+    config: VitsConfig,
+    model_args: ModelArguments,
+    data_args: DataTrainingArguments,
+    detected_num_speakers: int,
+):
+    if data_args.speaker_id_column_name is None or detected_num_speakers <= 1:
+        return
+
+    if model_args.override_speaker_embeddings:
+        return
+
+    if config.num_speakers <= 1 or config.speaker_embedding_size <= 0:
+        raise ValueError(
+            "Detected multiple speakers in the dataset, but the model config has no usable speaker embeddings. "
+            "Set `override_speaker_embeddings=true` or provide a config/checkpoint with "
+            "`num_speakers > 1` and `speaker_embedding_size > 0`."
+        )
+
+    if config.num_speakers < detected_num_speakers:
+        raise ValueError(
+            f"Detected {detected_num_speakers} speakers, but the config only supports {config.num_speakers}. "
+            "Set `override_speaker_embeddings=true` so the speaker tables are resized."
+        )
+
+
 @dataclass
 class DataCollatorTTSWithPadding:
     """
@@ -699,6 +756,9 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    if not model_args.from_scratch and model_args.model_name_or_path is None:
+        raise ValueError("`model_name_or_path` is required unless `from_scratch=True`.")
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_vits_finetuning", model_args, data_args)
@@ -827,8 +887,24 @@ def main():
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
+    config_source = resolve_artifact_source(
+        model_args.config_name,
+        model_args.model_name_or_path,
+        "config_name",
+    )
+    feature_extractor_source = resolve_artifact_source(
+        model_args.feature_extractor_name,
+        model_args.model_name_or_path,
+        "feature_extractor_name",
+    )
+    tokenizer_source = resolve_artifact_source(
+        model_args.tokenizer_name,
+        model_args.model_name_or_path,
+        "tokenizer_name",
+    )
+
     config = VitsConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        config_source,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=model_args.token,
@@ -836,14 +912,14 @@ def main():
     )
 
     feature_extractor = VitsFeatureExtractor.from_pretrained(
-        model_args.feature_extractor_name if model_args.feature_extractor_name else model_args.model_name_or_path,
+        feature_extractor_source,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        tokenizer_source,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
@@ -964,6 +1040,13 @@ def main():
     if training_args.do_eval and "eval" in raw_datasets and len(raw_datasets["eval"]) == 0:
         logger.warning("Eval split is empty after speaker filtering/truncation.")
 
+    validate_multispeaker_setup(
+        config=config,
+        model_args=model_args,
+        data_args=data_args,
+        detected_num_speakers=new_num_speakers,
+    )
+
     def prepare_dataset(batch):
         # process target audio
         sample = batch[audio_column_name]
@@ -1040,17 +1123,40 @@ def main():
         logger.info(f"Data preprocessing finished. Files cached at {cache}.")
         return
 
-    # 8. Load pretrained model,
+    # 8. Load pretrained model or initialize a fresh one from config.
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
-    model = VitsModelForPreTraining.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
+    if model_args.from_scratch:
+        if model_args.override_speaker_embeddings and data_args.speaker_id_column_name is not None:
+            if new_num_speakers > 1:
+                speaker_embedding_size = config.speaker_embedding_size if config.speaker_embedding_size > 1 else 256
+                logger.info(
+                    "Initializing from scratch with multispeaker setup: %d -> %d speakers, embedding size %d.",
+                    num_speakers,
+                    new_num_speakers,
+                    speaker_embedding_size,
+                )
+                config.num_speakers = new_num_speakers
+                config.speaker_embedding_size = speaker_embedding_size
+            elif new_num_speakers == 1:
+                logger.info("Only one speaker detected on the training set. Keeping single-speaker initialization.")
+
+        if model_args.override_vocabulary_embeddings:
+            new_num_tokens = len(tokenizer)
+            logger.info("Initializing from scratch with vocab size %d.", new_num_tokens)
+            config.vocab_size = new_num_tokens
+
+        logger.info("Initializing model from scratch using config from %s.", config_source)
+        model = VitsModelForPreTraining(config)
+    else:
+        model = VitsModelForPreTraining.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
 
     
     with training_args.main_process_first(desc="apply_weight_norm"):
@@ -1060,21 +1166,22 @@ def main():
             torch.nn.utils.weight_norm(flow.conv_pre)
             torch.nn.utils.weight_norm(flow.conv_post)
 
-        # override speaker embeddings if necessary
-        if model_args.override_speaker_embeddings and data_args.speaker_id_column_name is not None:
-            if new_num_speakers > 1:
-                speaker_embedding_size = config.speaker_embedding_size if config.speaker_embedding_size > 1 else 256
-                logger.info(
-                    f"Reinitializing speaker embeddings: {num_speakers} -> {new_num_speakers} speakers, embedding size {speaker_embedding_size}."
-                )
-                model.resize_speaker_embeddings(new_num_speakers, speaker_embedding_size)
-            elif new_num_speakers == 1:
-                logger.info("Only one speaker detected on the training set. Embeddings are not reinitialized.")
+        if not model_args.from_scratch:
+            # override speaker embeddings if necessary
+            if model_args.override_speaker_embeddings and data_args.speaker_id_column_name is not None:
+                if new_num_speakers > 1:
+                    speaker_embedding_size = config.speaker_embedding_size if config.speaker_embedding_size > 1 else 256
+                    logger.info(
+                        f"Reinitializing speaker embeddings: {num_speakers} -> {new_num_speakers} speakers, embedding size {speaker_embedding_size}."
+                    )
+                    model.resize_speaker_embeddings(new_num_speakers, speaker_embedding_size)
+                elif new_num_speakers == 1:
+                    logger.info("Only one speaker detected on the training set. Embeddings are not reinitialized.")
 
-        # override token embeddings if necessary
-        if model_args.override_vocabulary_embeddings:
-            new_num_tokens = len(tokenizer)
-            model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of=2)
+            # override token embeddings if necessary
+            if model_args.override_vocabulary_embeddings:
+                new_num_tokens = len(tokenizer)
+                model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of=2)
 
     # 9. Save configs
     # make sure all processes wait until data is saved
@@ -1084,7 +1191,7 @@ def main():
             # save feature extractor, tokenizer and config
             feature_extractor.save_pretrained(training_args.output_dir)
             tokenizer.save_pretrained(training_args.output_dir)
-            config.save_pretrained(training_args.output_dir)
+            model.config.save_pretrained(training_args.output_dir)
             if speaker_id_dict:
                 speaker_id_mapping_path = os.path.join(training_args.output_dir, "speaker_id_mapping.json")
                 with open(speaker_id_mapping_path, "w", encoding="utf-8") as speaker_mapping_file:
