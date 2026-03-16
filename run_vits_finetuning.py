@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import datasets
 import numpy as np
@@ -246,6 +246,24 @@ class DataTrainingArguments:
             )
         },
     )
+    min_speaker_hours: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set together with `speaker_id_column_name`, filters the dataset to keep only speakers whose "
+                "duration in `dataset_stats.json` is at least this many hours."
+            )
+        },
+    )
+    speaker_stats_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional path to `dataset_stats.json` used by `min_speaker_hours`. "
+                "Defaults to `<dataset_name>/dataset_stats.json` when `dataset_name` is a local directory."
+            )
+        },
+    )
 
     max_tokens_length: float = field(
         default=450,
@@ -317,6 +335,84 @@ class DataTrainingArguments:
     )
 
 # DATA COLLATOR
+
+
+def _normalize_speaker_id(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def speaker_id_is_allowed(speaker_id: int, allowed_speaker_ids: Set[int]) -> bool:
+    return int(speaker_id) in allowed_speaker_ids
+
+
+def load_min_speaker_hours_filter(
+    dataset_name: str,
+    speaker_stats_path: Optional[str],
+    min_speaker_hours: Optional[float],
+) -> Tuple[Optional[Set[int]], Optional[str], List[Tuple[int, str, float]]]:
+    if min_speaker_hours is None:
+        return None, None, []
+
+    if speaker_stats_path:
+        resolved_stats_path = os.path.abspath(speaker_stats_path)
+    elif dataset_name and os.path.isdir(dataset_name):
+        resolved_stats_path = os.path.join(os.path.abspath(dataset_name), "dataset_stats.json")
+    else:
+        raise ValueError(
+            "`min_speaker_hours` requires either a local `dataset_name` directory or an explicit `speaker_stats_path`."
+        )
+
+    if not os.path.exists(resolved_stats_path):
+        raise ValueError(
+            f"Speaker stats file not found at '{resolved_stats_path}'. "
+            "Run compute_audio_stats.py first or pass --speaker_stats_path."
+        )
+
+    with open(resolved_stats_path, "r", encoding="utf-8") as stats_file:
+        stats_data = json.load(stats_file)
+
+    per_speaker = stats_data.get("per_speaker")
+    if not isinstance(per_speaker, dict):
+        raise ValueError(
+            f"Expected a 'per_speaker' section in '{resolved_stats_path}' so speaker filtering can be computed."
+        )
+
+    kept_speakers: List[Tuple[int, str, float]] = []
+    missing_duration_count = 0
+
+    for speaker_name, speaker_stats in per_speaker.items():
+        if not isinstance(speaker_stats, dict):
+            continue
+
+        speaker_id = _normalize_speaker_id(speaker_stats.get("speaker_id"))
+        duration_hours = speaker_stats.get("duration_hours")
+        if speaker_id is None:
+            continue
+        if duration_hours is None:
+            missing_duration_count += 1
+            continue
+
+        duration_hours = float(duration_hours)
+        if duration_hours >= min_speaker_hours:
+            kept_speakers.append((speaker_id, speaker_name, duration_hours))
+
+    if not kept_speakers:
+        if missing_duration_count:
+            raise ValueError(
+                f"No usable speaker duration stats found in '{resolved_stats_path}'. "
+                "Run compute_audio_stats.py before using --min_speaker_hours."
+            )
+        raise ValueError(
+            f"No speakers met --min_speaker_hours={min_speaker_hours} using '{resolved_stats_path}'."
+        )
+
+    kept_speakers.sort(key=lambda item: (-item[2], item[0]))
+    return {speaker_id for speaker_id, _, _ in kept_speakers}, resolved_stats_path, kept_speakers
 
 
 @dataclass
@@ -793,16 +889,40 @@ def main():
     # return attention_mask for Vits models
     forward_attention_mask = True
 
-    with training_args.main_process_first(desc="select range of samples"):
-        if data_args.max_train_samples is not None:
-            raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
-
-        if data_args.max_eval_samples is not None:
-            raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
-
     speaker_id_dict = {}
     new_num_speakers = 0
     if speaker_id_column_name is not None:
+        if data_args.min_speaker_hours is not None:
+            allowed_speaker_ids, resolved_stats_path, kept_speakers = load_min_speaker_hours_filter(
+                dataset_name=data_args.dataset_name,
+                speaker_stats_path=data_args.speaker_stats_path,
+                min_speaker_hours=data_args.min_speaker_hours,
+            )
+            logger.info(
+                "Keeping %d speakers with duration >= %.2f hours using %s: %s",
+                len(kept_speakers),
+                data_args.min_speaker_hours,
+                resolved_stats_path,
+                ", ".join(f"{name} ({hours:.2f}h)" for _, name, hours in kept_speakers),
+            )
+
+            with training_args.main_process_first(desc="filter min speaker hours"):
+                for split_name in list(raw_datasets.keys()):
+                    before_count = len(raw_datasets[split_name])
+                    raw_datasets[split_name] = raw_datasets[split_name].filter(
+                        speaker_id_is_allowed,
+                        fn_kwargs={"allowed_speaker_ids": allowed_speaker_ids},
+                        num_proc=num_workers,
+                        input_columns=[speaker_id_column_name],
+                    )
+                    after_count = len(raw_datasets[split_name])
+                    logger.info(
+                        "Split '%s': kept %d/%d samples after min_speaker_hours filter.",
+                        split_name,
+                        after_count,
+                        before_count,
+                    )
+
         if training_args.do_train:
             # if filter_on_speaker_id, filter so that we keep only the speaker id
             if filter_on_speaker_id is not None:
@@ -828,6 +948,21 @@ def main():
                             "They will default to speaker_id=0 during preprocessing.",
                             len(unseen_eval_speaker_ids),
                         )
+    elif data_args.min_speaker_hours is not None:
+        raise ValueError("`min_speaker_hours` requires `speaker_id_column_name` to be set.")
+
+    with training_args.main_process_first(desc="select range of samples"):
+        if data_args.max_train_samples is not None:
+            raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
+
+        if data_args.max_eval_samples is not None and "eval" in raw_datasets:
+            raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
+
+    if training_args.do_train and len(raw_datasets["train"]) == 0:
+        raise ValueError("Training split is empty after speaker filtering/truncation. Lower the cutoff or inspect dataset_stats.json.")
+
+    if training_args.do_eval and "eval" in raw_datasets and len(raw_datasets["eval"]) == 0:
+        logger.warning("Eval split is empty after speaker filtering/truncation.")
 
     def prepare_dataset(batch):
         # process target audio

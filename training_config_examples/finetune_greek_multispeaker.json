@@ -1,14 +1,16 @@
 {
-    "project_name": "mms_greek_multispeaker_finetuning",
+    "project_name": "mms_greek_multispeaker_finetuning_1h_cutoff",
     "push_to_hub": false,
     "report_to": ["wandb"],
     "overwrite_output_dir": true,
-    "output_dir": "/leonardo_work/EUHPC_D29_081/gsyllas0/output/vits_finetuned_greek_multispeaker_v2",
+    "output_dir": "/leonardo_work/EUHPC_D29_081/gsyllas0/output/vits_finetuned_greek_multispeaker_combined_1h",
 
-    "dataset_name": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/greek_multispeaker_vits",
+    "dataset_name": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/multi_speaker_combined",
     "audio_column_name": "audio",
     "text_column_name": "text",
     "speaker_id_column_name": "speaker_id",
+    "speaker_stats_path": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/multi_speaker_combined/dataset_stats.json",
+    "min_speaker_hours": 1.0,
     "train_split_name": "train",
     "eval_split_name": "eval",
 
