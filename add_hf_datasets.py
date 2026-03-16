@@ -74,6 +74,13 @@ def get_audio_duration(audio_value, enabled: bool = True) -> Optional[float]:
     return None
 
 
+def maybe_disable_audio_decoding(dataset: Dataset, enabled: bool) -> Dataset:
+    """Return a dataset view that skips audio decoding when durations are not needed."""
+    if enabled or "audio" not in dataset.column_names:
+        return dataset
+    return dataset.cast_column("audio", Audio(decode=False))
+
+
 def load_existing_dataset(dataset_dir: str):
     obj = load_from_disk(dataset_dir)
     if isinstance(obj, DatasetDict):
@@ -141,7 +148,8 @@ class StatsAccumulator:
         has_speaker = "speaker_name" in dataset.column_names
         note = "" if audio_stats else " (audio decoding skipped)"
         print(f"  Collecting stats for '{source}' ({len(dataset):,} samples){note} …")
-        for row in dataset:
+        dataset_view = maybe_disable_audio_decoding(dataset, enabled=audio_stats)
+        for row in dataset_view:
             dur = get_audio_duration(row["audio"], enabled=audio_stats)
             text_len = len((row.get("text") or "").strip())
             spk = row.get("speaker_name") if has_speaker else None
@@ -219,6 +227,7 @@ def process_hf_dataset(
 ) -> Dataset:
     print(f"\nDownloading {repo_id} (split={split}) …")
     hf_ds = load_dataset(repo_id, split=split, trust_remote_code=True)
+    hf_ds = maybe_disable_audio_decoding(hf_ds, enabled=audio_stats)
 
     available = hf_ds.column_names
     if text_column not in available:
@@ -241,56 +250,77 @@ def process_hf_dataset(
 
     filtered_english = 0
     skipped_speaker = 0
-    records = []
+    kept = 0
 
-    for row in hf_ds:
-        text = (row[text_column] or "").strip()
-        if not text:
-            continue
-        if drop_english and contains_english(text):
-            filtered_english += 1
-            continue
+    def transform_batch(batch: Dict[str, List[object]]) -> Dict[str, List[object]]:
+        nonlocal filtered_english, skipped_speaker, kept
 
-        record = {"audio": row["audio"], "text": text}
-
-        speaker_name: Optional[str] = None
+        output: Dict[str, List[object]] = {"audio": [], "text": []}
         if need_speaker:
-            if speaker_column:
-                raw = str(row[speaker_column]).strip()
-                speaker_name = f"{speaker_id_prefix}_{raw}" if speaker_id_prefix else raw
-            elif speaker_from_filename and filename_col:
-                fname = (row.get(filename_col) or "").strip()
-                parent = os.path.basename(os.path.dirname(fname))
-                raw = parent if parent else None
-                if raw:
-                    speaker_name = f"{speaker_id_prefix}_{raw}" if speaker_id_prefix else raw
-            elif fixed_speaker_name:
-                speaker_name = f"{speaker_id_prefix}_{fixed_speaker_name}" if speaker_id_prefix else fixed_speaker_name
+            output["speaker_id"] = []
+            output["speaker_name"] = []
 
-            if speaker_name is None or speaker_name == "":
-                skipped_speaker += 1
+        batch_size = len(batch[text_column])
+        for idx in range(batch_size):
+            text_value = batch[text_column][idx]
+            text = str(text_value or "").strip()
+            if not text:
+                continue
+            if drop_english and contains_english(text):
+                filtered_english += 1
                 continue
 
-            record["speaker_id"] = get_or_create_speaker_id(speaker_name, speaker_mapping)
-            record["speaker_name"] = speaker_name
+            speaker_name: Optional[str] = None
+            if need_speaker:
+                if speaker_column:
+                    raw = str(batch[speaker_column][idx]).strip()
+                    speaker_name = f"{speaker_id_prefix}_{raw}" if speaker_id_prefix else raw
+                elif speaker_from_filename and filename_col:
+                    fname = str(batch[filename_col][idx] or "").strip()
+                    parent = os.path.basename(os.path.dirname(fname))
+                    raw = parent if parent else None
+                    if raw:
+                        speaker_name = f"{speaker_id_prefix}_{raw}" if speaker_id_prefix else raw
+                elif fixed_speaker_name:
+                    speaker_name = f"{speaker_id_prefix}_{fixed_speaker_name}" if speaker_id_prefix else fixed_speaker_name
 
-        dur = get_audio_duration(row["audio"], enabled=audio_stats)
-        stats.add(repo_id, dur, len(text), speaker_name)
-        records.append(record)
+                if speaker_name is None or speaker_name == "":
+                    skipped_speaker += 1
+                    continue
 
-    print(f"  Kept {len(records):,} samples from {repo_id}")
+            audio_value = batch["audio"][idx]
+            output["audio"].append(audio_value)
+            output["text"].append(text)
+
+            if need_speaker:
+                output["speaker_id"].append(get_or_create_speaker_id(speaker_name, speaker_mapping))
+                output["speaker_name"].append(speaker_name)
+
+            dur = get_audio_duration(audio_value, enabled=audio_stats)
+            stats.add(repo_id, dur, len(text), speaker_name)
+            kept += 1
+
+        return output
+
+    ds = hf_ds.map(
+        transform_batch,
+        batched=True,
+        batch_size=128,
+        writer_batch_size=128,
+        remove_columns=available,
+        load_from_cache_file=False,
+        desc=f"Processing {repo_id}",
+    )
+    ds = ds.cast_column("audio", Audio())
+
+    print(f"  Kept {kept:,} samples from {repo_id}")
     if filtered_english:
         print(f"  Filtered {filtered_english:,} samples with English characters")
     if skipped_speaker:
         print(f"  Skipped {skipped_speaker:,} samples with missing speaker")
 
-    if not records:
+    if kept == 0:
         raise ValueError(f"No valid records from {repo_id} after filtering.")
-
-    keys = records[0].keys()
-    columns = {k: [r[k] for r in records] for k in keys}
-    ds = Dataset.from_dict(columns)
-    ds = ds.cast_column("audio", Audio())
     return ds
 
 
