@@ -7,10 +7,12 @@ import logging
 import math
 import os
 import json
+import re
 import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import datasets
@@ -44,6 +46,7 @@ if is_wandb_available():
 
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 logger = logging.getLogger(__name__)
+TIMEOUT_RESUME_REQUEST_FILENAME = ".slurm_resume_requested"
 
 
 #### ARGUMENTS
@@ -446,6 +449,141 @@ def resolve_artifact_source(
     return source
 
 
+def _format_run_name_value(value: Optional[Union[str, int, float]]) -> Optional[str]:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    text = re.sub(r"[\\/]+", "-", text)
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text)
+    return text.strip("-_.") or None
+
+
+def _label_from_path(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    normalized = os.path.normpath(str(value).strip())
+    if not normalized:
+        return None
+
+    return _format_run_name_value(os.path.basename(normalized))
+
+
+def _speaker_scope_label(data_args: "DataTrainingArguments") -> Optional[str]:
+    if data_args.filter_on_speaker_id is not None:
+        return f"speaker-{data_args.filter_on_speaker_id}"
+
+    if not data_args.speaker_id_column_name:
+        return "single-speaker"
+
+    if data_args.min_speaker_hours is not None:
+        min_hours = _format_run_name_value(f"{data_args.min_speaker_hours:g}")
+        return f"multi-speaker-min-{min_hours}h"
+
+    return "multi-speaker"
+
+
+def resolve_run_name(
+    model_args: "ModelArguments",
+    data_args: "DataTrainingArguments",
+    training_args: "VITSTrainingArguments",
+    config_path: Optional[str] = None,
+) -> str:
+    explicit_run_name = _format_run_name_value(getattr(training_args, "run_name", None))
+    env_run_name = _format_run_name_value(os.getenv("WANDB_RUN_NAME") or os.getenv("WANDB_NAME"))
+
+    if explicit_run_name:
+        return explicit_run_name
+    if env_run_name:
+        return env_run_name
+
+    primary_label = (
+        _label_from_path(training_args.output_dir)
+        or _label_from_path(config_path)
+        or _format_run_name_value(data_args.project_name)
+        or "vits-run"
+    )
+    dataset_label = _label_from_path(data_args.dataset_name) or _format_run_name_value(data_args.dataset_name)
+    model_source = model_args.model_name_or_path or model_args.config_name or model_args.tokenizer_name
+    model_label = _label_from_path(model_source) or _format_run_name_value(model_source)
+    mode_label = "scratch" if model_args.from_scratch else "finetune"
+    speaker_label = _speaker_scope_label(data_args)
+    slurm_job_name = _format_run_name_value(os.getenv("SLURM_JOB_NAME"))
+
+    parts: List[str] = []
+    for part in [slurm_job_name, primary_label, mode_label, dataset_label, speaker_label, model_label]:
+        if part and part not in parts:
+            parts.append(part)
+
+    slurm_job_id = _format_run_name_value(os.getenv("SLURM_JOB_ID"))
+    slurm_array_task_id = _format_run_name_value(os.getenv("SLURM_ARRAY_TASK_ID"))
+    if slurm_job_id and slurm_array_task_id:
+        parts.append(f"job-{slurm_job_id}-{slurm_array_task_id}")
+    elif slurm_job_id:
+        parts.append(f"job-{slurm_job_id}")
+    else:
+        parts.append(datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+    return "__".join(parts)
+
+
+def get_timeout_resume_request_path(output_dir: str) -> str:
+    return os.path.join(output_dir, TIMEOUT_RESUME_REQUEST_FILENAME)
+
+
+def timeout_resume_requested(output_dir: str) -> bool:
+    return os.path.exists(get_timeout_resume_request_path(output_dir))
+
+
+def clear_timeout_resume_request(output_dir: str) -> None:
+    request_path = get_timeout_resume_request_path(output_dir)
+    if os.path.exists(request_path):
+        os.remove(request_path)
+
+
+def save_training_checkpoint(accelerator: Accelerator, training_args: "VITSTrainingArguments", global_step: int) -> str:
+    os.makedirs(training_args.output_dir, exist_ok=True)
+
+    if accelerator.is_main_process and training_args.save_total_limit is not None:
+        checkpoints = os.listdir(training_args.output_dir)
+        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+        if len(checkpoints) >= training_args.save_total_limit:
+            num_to_remove = len(checkpoints) - training_args.save_total_limit + 1
+            removing_checkpoints = checkpoints[0:num_to_remove]
+
+            logger.info(
+                "%d checkpoints already exist, removing %d checkpoints",
+                len(checkpoints),
+                len(removing_checkpoints),
+            )
+            logger.info("removing checkpoints: %s", ", ".join(removing_checkpoints))
+
+            for removing_checkpoint in removing_checkpoints:
+                removing_checkpoint = os.path.join(training_args.output_dir, removing_checkpoint)
+                shutil.rmtree(removing_checkpoint)
+
+    save_step = max(int(global_step), 0)
+    save_path = os.path.join(training_args.output_dir, f"checkpoint-{save_step}")
+
+    if accelerator.is_main_process:
+        if os.path.isdir(save_path):
+            logger.info("Checkpoint already exists at %s", save_path)
+        else:
+            accelerator.save_state(save_path)
+            logger.info("Saved state to %s", save_path)
+
+    accelerator.wait_for_everyone()
+    return save_path
+
+
 def validate_multispeaker_setup(
     config: VitsConfig,
     model_args: ModelArguments,
@@ -716,11 +854,12 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, VITSTrainingArguments))
+    config_path = os.path.abspath(sys.argv[1]) if len(sys.argv) >= 2 and sys.argv[1].endswith(".json") else None
 
-    if len(sys.argv) >= 2 and sys.argv[1].endswith(".json"):
+    if config_path is not None:
         # If we pass a JSON config first, load it and optionally override fields
         # with extra CLI args that follow.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args = parser.parse_json_file(json_file=config_path)
 
         if len(sys.argv) > 2:
             merged_args = {}
@@ -777,6 +916,15 @@ def main():
     transformers.utils.logging.enable_explicit_format()
 
     logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
+    resolved_run_name = resolve_run_name(
+        model_args=model_args,
+        data_args=data_args,
+        training_args=training_args,
+        config_path=config_path,
+    )
+    training_args.run_name = resolved_run_name
+    os.environ["WANDB_NAME"] = resolved_run_name
+    logger.info("Resolved W&B run name: %s", resolved_run_name)
 
     # Log on each process the small summary:
     logger.warning(
@@ -800,6 +948,7 @@ def main():
                 "Use --overwrite_output_dir to overcome."
             )
         elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            training_args.resume_from_checkpoint = "latest"
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
@@ -1237,6 +1386,10 @@ def main():
         kwargs_handlers=[ddp_kwargs],
     )
 
+    if accelerator.is_main_process and timeout_resume_requested(training_args.output_dir):
+        clear_timeout_resume_request(training_args.output_dir)
+    accelerator.wait_for_everyone()
+
     per_device_train_batch_size = (
         training_args.per_device_train_batch_size if training_args.per_device_train_batch_size else 1
     )
@@ -1430,6 +1583,9 @@ def main():
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = training_args.to_sanitized_dict()
+        tracker_config["resolved_run_name"] = training_args.run_name
+        tracker_config["slurm_job_name"] = os.getenv("SLURM_JOB_NAME")
+        tracker_config["slurm_job_id"] = os.getenv("SLURM_JOB_ID")
         accelerator.init_trackers(project_name, tracker_config)
 
     # Train!
@@ -1480,6 +1636,7 @@ def main():
     )
 
     backbone_unfrozen = freeze_backbone_epochs == 0
+    stop_requested = False
     for epoch in range(first_epoch, training_args.num_train_epochs):
         # Unfreeze backbone after freeze_backbone_epochs by restoring its LR
         if not backbone_unfrozen and epoch >= freeze_backbone_epochs:
@@ -1641,30 +1798,19 @@ def main():
                 train_losses = [0.0 for _ in train_losses]
 
                 if global_step % training_args.save_steps == 0:
+                    save_training_checkpoint(accelerator, training_args, global_step)
+
+                if timeout_resume_requested(training_args.output_dir):
+                    logger.warning(
+                        "Timeout resume requested. Saving a checkpoint and stopping cleanly at step %s.",
+                        global_step,
+                    )
+                    save_training_checkpoint(accelerator, training_args, global_step)
                     if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `save_total_limit`
-                        if training_args.save_total_limit is not None:
-                            checkpoints = os.listdir(training_args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `save_total_limit - 1` checkpoints
-                            if len(checkpoints) >= training_args.save_total_limit:
-                                num_to_remove = len(checkpoints) - training_args.save_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(training_args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
-                        save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        clear_timeout_resume_request(training_args.output_dir)
+                    accelerator.wait_for_everyone()
+                    stop_requested = True
+                    break
 
             logs = {
                 "step_loss": total_generator_loss.detach().item(),
@@ -1681,6 +1827,8 @@ def main():
             progress_bar.set_postfix(**logs)
 
             if global_step >= training_args.max_steps:
+                break
+            if stop_requested:
                 break
 
             eval_steps = training_args.eval_steps if training_args.eval_steps else 1
@@ -1797,7 +1945,16 @@ def main():
 
                 accelerator.wait_for_everyone()
 
+        if stop_requested:
+            logger.info("Stopping training early after handling a timeout resume request.")
+            break
+
     accelerator.wait_for_everyone()
+    if stop_requested:
+        if accelerator.is_main_process:
+            logger.info("Exiting after timeout checkpoint save; the follow-up Slurm job can resume from latest.")
+        return
+
     if accelerator.is_main_process:
         epoch = training_args.num_train_epochs if training_args.num_train_epochs else 1
         eval_steps = training_args.eval_steps if training_args.eval_steps else 1

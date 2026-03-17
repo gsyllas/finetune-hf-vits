@@ -26,6 +26,14 @@ export WANDB_MODE=offline
 # Go to project directory
 cd /leonardo_work/EUHPC_D29_081/gsyllas0/finetune-hf-vits
 
-# Run training
-accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek.json
+# Optional manual W&B run label, e.g.
+# sbatch --export=ALL,RUN_NAME=greek-finetune-exp1 run_leonardo.slurm
+RUN_NAME=${RUN_NAME:-}
+RUN_NAME_ARGS=()
+if [ -n "${RUN_NAME}" ]; then
+    RUN_NAME_ARGS=(--run_name "${RUN_NAME}")
+fi
 
+# Run training
+accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek.json \
+    "${RUN_NAME_ARGS[@]}"

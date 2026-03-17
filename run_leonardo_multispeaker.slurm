@@ -23,12 +23,18 @@ export WANDB_MODE=offline
 cd /leonardo_work/EUHPC_D29_081/gsyllas0/finetune-hf-vits
 
 # Override these at submission time if needed, e.g.
-# sbatch --export=ALL,MIN_SPEAKER_HOURS=0.5 run_leonardo_multispeaker.slurm
+# sbatch --export=ALL,MIN_SPEAKER_HOURS=0.5,RUN_NAME=greek-multi-0p5h run_leonardo_multispeaker.slurm
 DATASET_DIR=${DATASET_DIR:-/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/multi_speaker_combined}
 SPEAKER_STATS_PATH=${SPEAKER_STATS_PATH:-${DATASET_DIR}/dataset_stats.json}
 MIN_SPEAKER_HOURS=${MIN_SPEAKER_HOURS:-1.0}
+RUN_NAME=${RUN_NAME:-}
+RUN_NAME_ARGS=()
+if [ -n "${RUN_NAME}" ]; then
+    RUN_NAME_ARGS=(--run_name "${RUN_NAME}")
+fi
 
 accelerate launch run_vits_finetuning.py ./training_config_examples/finetune_greek_multispeaker.json \
     --dataset_name "${DATASET_DIR}" \
     --speaker_stats_path "${SPEAKER_STATS_PATH}" \
-    --min_speaker_hours "${MIN_SPEAKER_HOURS}"
+    --min_speaker_hours "${MIN_SPEAKER_HOURS}" \
+    "${RUN_NAME_ARGS[@]}"

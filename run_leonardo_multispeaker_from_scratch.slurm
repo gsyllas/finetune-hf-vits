@@ -23,13 +23,18 @@ export WANDB_MODE=offline
 cd /leonardo_work/EUHPC_D29_081/gsyllas0/finetune-hf-vits
 
 # Override these at submission time if needed, e.g.
-# sbatch --export=ALL,MIN_SPEAKER_HOURS=0.5,OUTPUT_DIR=/path/to/output run_leonardo_multispeaker_from_scratch.slurm
+# sbatch --export=ALL,MIN_SPEAKER_HOURS=0.5,OUTPUT_DIR=/path/to/output,RUN_NAME=greek-multi-scratch-0p5h run_leonardo_multispeaker_from_scratch.slurm
 CONFIG_JSON=${CONFIG_JSON:-./training_config_examples/from_scratch_greek_multispeaker.json}
 DATASET_DIR=${DATASET_DIR:-/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/multi_speaker_combined}
 SPEAKER_STATS_PATH=${SPEAKER_STATS_PATH:-${DATASET_DIR}/dataset_stats.json}
 MIN_SPEAKER_HOURS=${MIN_SPEAKER_HOURS:-1.0}
 ARTIFACT_SOURCE=${ARTIFACT_SOURCE:-/leonardo_work/EUHPC_D29_081/gsyllas0/models/mms-tts-ell-train}
 OUTPUT_DIR=${OUTPUT_DIR:-/leonardo_work/EUHPC_D29_081/gsyllas0/output/vits_from_scratch_greek_multispeaker_combined_1h}
+RUN_NAME=${RUN_NAME:-}
+RUN_NAME_ARGS=()
+if [ -n "${RUN_NAME}" ]; then
+    RUN_NAME_ARGS=(--run_name "${RUN_NAME}")
+fi
 
 accelerate launch run_vits_finetuning.py "${CONFIG_JSON}" \
     --dataset_name "${DATASET_DIR}" \
@@ -38,4 +43,5 @@ accelerate launch run_vits_finetuning.py "${CONFIG_JSON}" \
     --config_name "${ARTIFACT_SOURCE}" \
     --tokenizer_name "${ARTIFACT_SOURCE}" \
     --feature_extractor_name "${ARTIFACT_SOURCE}" \
-    --output_dir "${OUTPUT_DIR}"
+    --output_dir "${OUTPUT_DIR}" \
+    "${RUN_NAME_ARGS[@]}"
