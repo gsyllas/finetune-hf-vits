@@ -1379,9 +1379,16 @@ def main():
     logging_dir = os.path.join(training_args.output_dir, training_args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=training_args.output_dir, logging_dir=logging_dir)
 
+    mixed_precision = "no"
+    if getattr(training_args, "bf16", False):
+        mixed_precision = "bf16"
+    elif training_args.fp16:
+        mixed_precision = "fp16"
+
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         log_with=training_args.report_to,
+        mixed_precision=mixed_precision,
         project_config=accelerator_project_config,
         kwargs_handlers=[ddp_kwargs],
     )
@@ -1389,6 +1396,16 @@ def main():
     if accelerator.is_main_process and timeout_resume_requested(training_args.output_dir):
         clear_timeout_resume_request(training_args.output_dir)
     accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        logger.info(
+            "Accelerate runtime: num_processes=%s, process_index=%s, local_process_index=%s, WORLD_SIZE=%s, CUDA_VISIBLE_DEVICES=%s",
+            accelerator.num_processes,
+            accelerator.process_index,
+            accelerator.local_process_index,
+            os.getenv("WORLD_SIZE", "unset"),
+            os.getenv("CUDA_VISIBLE_DEVICES", "unset"),
+        )
 
     per_device_train_batch_size = (
         training_args.per_device_train_batch_size if training_args.per_device_train_batch_size else 1
@@ -1661,7 +1678,6 @@ def main():
                 gen_optimizer.param_groups[0]["lr"] = 0.0
 
         for step, batch in enumerate(train_dataloader):
-            print(f"batch {step}, process{accelerator.process_index}, waveform {(batch['waveform'].shape)}, tokens {(batch['input_ids'].shape)}... ")
             with accelerator.accumulate(model, discriminator):
                 # forward through model
                 model_outputs = model(
