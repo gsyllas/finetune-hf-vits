@@ -397,7 +397,7 @@ def _rational_quadratic_spline(
     """
     upper_bound = tail_bound
     lower_bound = -tail_bound
-    if torch.min(inputs) < lower_bound or torch.max(inputs) > upper_bound:
+    if inputs.numel() > 0 and (torch.min(inputs) < lower_bound or torch.max(inputs) > upper_bound):
         raise ValueError("Input to a transform is not within its domain")
 
     num_bins = unnormalized_widths.shape[-1]

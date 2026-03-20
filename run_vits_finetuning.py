@@ -194,6 +194,16 @@ class VITSTrainingArguments(TrainingArguments):
         },
     )
 
+    use_optimized_dataloader: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to enable the tuned dataloader path for higher throughput. "
+                "When disabled, preserves the original dataloader behavior."
+            )
+        },
+    )
+
 
 @dataclass
 class DataTrainingArguments:
@@ -741,8 +751,12 @@ def kl_loss(prior_latents, posterior_log_variance, prior_means, prior_log_varian
     prior_means, prior_log_variance: [b, h, t_t]
     """
 
-    kl = prior_log_variance - posterior_log_variance - 0.5
-    kl += 0.5 * ((prior_latents - prior_means) ** 2) * torch.exp(-2.0 * prior_log_variance)
+    # Clamp log_variance to prevent exp() overflow (critical for fp16/bf16 stability)
+    prior_log_variance_clamped = torch.clamp(prior_log_variance, min=-13.0, max=13.0)
+    posterior_log_variance_clamped = torch.clamp(posterior_log_variance, min=-13.0, max=13.0)
+
+    kl = prior_log_variance_clamped - posterior_log_variance_clamped - 0.5
+    kl += 0.5 * ((prior_latents - prior_means) ** 2) * torch.exp(-2.0 * prior_log_variance_clamped)
     kl = torch.sum(kl * labels_mask)
     loss = kl / torch.sum(labels_mask)
     return loss
@@ -1419,6 +1433,39 @@ def main():
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    length_column_name = "tokens_input_length"
+    if training_args.use_optimized_dataloader and "waveform_input_length" in train_dataset.column_names:
+        length_column_name = "waveform_input_length"
+    dataloader_num_workers = training_args.dataloader_num_workers
+    dataloader_pin_memory = False
+    dataloader_persistent_workers = False
+    dataloader_prefetch_factor = None
+    if training_args.use_optimized_dataloader:
+        dataloader_pin_memory = getattr(training_args, "dataloader_pin_memory", torch.cuda.is_available())
+        dataloader_persistent_workers = getattr(training_args, "dataloader_persistent_workers", True)
+        dataloader_prefetch_factor = getattr(training_args, "dataloader_prefetch_factor", 2)
+
+    dataloader_common_kwargs = {
+        "collate_fn": data_collator,
+        "num_workers": dataloader_num_workers,
+        "pin_memory": dataloader_pin_memory,
+    }
+    if dataloader_num_workers > 0:
+        dataloader_common_kwargs["persistent_workers"] = dataloader_persistent_workers
+        if dataloader_prefetch_factor is not None:
+            dataloader_common_kwargs["prefetch_factor"] = dataloader_prefetch_factor
+
+    logger.info(
+        "DataLoader settings: optimized=%s, workers=%s, pin_memory=%s, persistent_workers=%s, prefetch_factor=%s, group_by_length=%s (%s)",
+        training_args.use_optimized_dataloader,
+        dataloader_num_workers,
+        dataloader_pin_memory,
+        dataloader_common_kwargs.get("persistent_workers", False),
+        dataloader_common_kwargs.get("prefetch_factor"),
+        training_args.group_by_length,
+        length_column_name,
+    )
+
     # 12. Define train_dataloader and eval_dataloader if relevant
     train_dataloader = None
     if training_args.do_train:
@@ -1426,7 +1473,7 @@ def main():
             LengthGroupedSampler(
                 batch_size=per_device_train_batch_size,
                 dataset=train_dataset,
-                lengths=train_dataset["tokens_input_length"],
+                lengths=train_dataset[length_column_name],
             )
             if training_args.group_by_length
             else None
@@ -1434,10 +1481,9 @@ def main():
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             shuffle=not training_args.group_by_length,
-            collate_fn=data_collator,
             batch_size=training_args.per_device_train_batch_size,
-            num_workers=training_args.dataloader_num_workers,
             sampler=sampler,
+            **dataloader_common_kwargs,
         )
 
     eval_dataloader = None
@@ -1446,7 +1492,7 @@ def main():
             LengthGroupedSampler(
                 batch_size=training_args.per_device_eval_batch_size,
                 dataset=eval_dataset,
-                lengths=eval_dataset["tokens_input_length"],
+                lengths=eval_dataset[length_column_name],
             )
             if training_args.group_by_length
             else None
@@ -1455,10 +1501,9 @@ def main():
         eval_dataloader = torch.utils.data.DataLoader(
             eval_dataset,
             shuffle=False,
-            collate_fn=data_collator,
             batch_size=training_args.per_device_eval_batch_size,
-            num_workers=training_args.dataloader_num_workers,
             sampler=eval_sampler,
+            **dataloader_common_kwargs,
         )
 
     model_segment_size = model.segment_size
@@ -1654,6 +1699,8 @@ def main():
 
     backbone_unfrozen = freeze_backbone_epochs == 0
     stop_requested = False
+    nan_count = 0
+    max_consecutive_nan = 50  # abort if NaN persists this many steps
     for epoch in range(first_epoch, training_args.num_train_epochs):
         # Unfreeze backbone after freeze_backbone_epochs by restoring its LR
         if not backbone_unfrozen and epoch >= freeze_backbone_epochs:
@@ -1712,11 +1759,16 @@ def main():
                     discriminator_target, discriminator_candidate
                 )
 
-                # backpropagate
-                accelerator.backward(loss_disc * training_args.weight_disc)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(discriminator.parameters(), training_args.max_grad_norm)
-                disc_optimizer.step()
+                # backpropagate discriminator
+                disc_loss_weighted = loss_disc * training_args.weight_disc
+                disc_is_nan = torch.isnan(disc_loss_weighted) or torch.isinf(disc_loss_weighted)
+                if not disc_is_nan:
+                    accelerator.backward(disc_loss_weighted)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(discriminator.parameters(), training_args.max_grad_norm)
+                    disc_optimizer.step()
+                else:
+                    logger.warning("Step %d: NaN/Inf in discriminator loss — skipping disc update.", global_step)
                 if not training_args.do_step_schedule_per_epoch:
                     disc_lr_scheduler.step()
                 disc_optimizer.zero_grad()
@@ -1748,11 +1800,29 @@ def main():
                     + loss_gen * training_args.weight_gen
                 )
 
-                # backpropagate
-                accelerator.backward(total_generator_loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
-                gen_optimizer.step()
+                # backpropagate generator with NaN protection
+                gen_is_nan = torch.isnan(total_generator_loss) or torch.isinf(total_generator_loss)
+                if not gen_is_nan:
+                    nan_count = 0
+                    accelerator.backward(total_generator_loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
+                    gen_optimizer.step()
+                else:
+                    nan_count += 1
+                    logger.warning(
+                        "Step %d: NaN/Inf in generator loss (consecutive=%d) — skipping gen update. "
+                        "Components: dur=%.4g mel=%.4g kl=%.4g fmap=%.4g gen=%.4g",
+                        global_step, nan_count,
+                        loss_duration.item() if not torch.isnan(loss_duration) else float("nan"),
+                        loss_mel.item() if not torch.isnan(loss_mel) else float("nan"),
+                        loss_kl.item() if not torch.isnan(loss_kl) else float("nan"),
+                        loss_fmaps.item() if not torch.isnan(loss_fmaps) else float("nan"),
+                        loss_gen.item() if not torch.isnan(loss_gen) else float("nan"),
+                    )
+                    if nan_count >= max_consecutive_nan:
+                        logger.error("Aborting: %d consecutive NaN steps.", max_consecutive_nan)
+                        stop_requested = True
                 if not training_args.do_step_schedule_per_epoch:
                     gen_lr_scheduler.step()
                     if not backbone_unfrozen:
@@ -1839,6 +1909,7 @@ def main():
                 "step_loss_disc": loss_disc.detach().item(),
                 "step_loss_real_disc": loss_real_disc.detach().item(),
                 "step_loss_fake_disc": loss_fake_disc.detach().item(),
+                "nan_skipped": float(gen_is_nan or disc_is_nan),
             }
             progress_bar.set_postfix(**logs)
 
