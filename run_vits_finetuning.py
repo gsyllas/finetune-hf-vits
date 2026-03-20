@@ -710,10 +710,13 @@ class DataCollatorTTSWithPadding:
 # LOSSES
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    # Cast to float32 for loss computation — matches original VITS autocast(enabled=False)
     loss = 0
     real_losses = 0
     generated_losses = 0
     for disc_real, disc_generated in zip(disc_real_outputs, disc_generated_outputs):
+        disc_real = disc_real.float()
+        disc_generated = disc_generated.float()
         real_loss = torch.mean((1 - disc_real) ** 2)
         generated_loss = torch.mean(disc_generated**2)
         loss += real_loss + generated_loss
@@ -727,8 +730,8 @@ def feature_loss(feature_maps_real, feature_maps_generated):
     loss = 0
     for feature_map_real, feature_map_generated in zip(feature_maps_real, feature_maps_generated):
         for real, generated in zip(feature_map_real, feature_map_generated):
-            real = real.detach()
-            loss += torch.mean(torch.abs(real - generated))
+            real = real.float().detach()
+            loss += torch.mean(torch.abs(real - generated.float()))
 
     return loss * 2
 
@@ -737,7 +740,7 @@ def generator_loss(disc_outputs):
     total_loss = 0
     gen_losses = []
     for disc_output in disc_outputs:
-        disc_output = disc_output
+        disc_output = disc_output.float()
         loss = torch.mean((1 - disc_output) ** 2)
         gen_losses.append(loss)
         total_loss += loss
@@ -750,13 +753,16 @@ def kl_loss(prior_latents, posterior_log_variance, prior_means, prior_log_varian
     z_p, logs_q: [b, h, t_t]
     prior_means, prior_log_variance: [b, h, t_t]
     """
+    # Cast to float32 — matches original VITS autocast(enabled=False).
+    # This is critical: exp(-2 * log_var) overflows fp16 when log_var < -5.5.
+    prior_latents = prior_latents.float()
+    posterior_log_variance = posterior_log_variance.float()
+    prior_means = prior_means.float()
+    prior_log_variance = prior_log_variance.float()
+    labels_mask = labels_mask.float()
 
-    # Clamp log_variance to prevent exp() overflow (critical for fp16/bf16 stability)
-    prior_log_variance_clamped = torch.clamp(prior_log_variance, min=-13.0, max=13.0)
-    posterior_log_variance_clamped = torch.clamp(posterior_log_variance, min=-13.0, max=13.0)
-
-    kl = prior_log_variance_clamped - posterior_log_variance_clamped - 0.5
-    kl += 0.5 * ((prior_latents - prior_means) ** 2) * torch.exp(-2.0 * prior_log_variance_clamped)
+    kl = prior_log_variance - posterior_log_variance - 0.5
+    kl += 0.5 * ((prior_latents - prior_means) ** 2) * torch.exp(-2.0 * prior_log_variance)
     kl = torch.sum(kl * labels_mask)
     loss = kl / torch.sum(labels_mask)
     return loss
@@ -842,7 +848,7 @@ def compute_val_metrics_and_losses(
     batch_size,
     compute_clap_similarity=False,
 ):
-    loss_mel = torch.nn.functional.l1_loss(mel_scaled_target, mel_scaled_generation)
+    loss_mel = torch.nn.functional.l1_loss(mel_scaled_target.float(), mel_scaled_generation.float())
     loss_kl = kl_loss(
         model_outputs.prior_latents,
         model_outputs.posterior_log_variances,
@@ -1759,11 +1765,18 @@ def main():
                     discriminator_target, discriminator_candidate
                 )
 
-                # backpropagate discriminator
+                # backpropagate discriminator — always call backward to keep
+                # NCCL collectives in sync across ranks; skip optimizer.step on NaN.
                 disc_loss_weighted = loss_disc * training_args.weight_disc
-                disc_is_nan = torch.isnan(disc_loss_weighted) or torch.isinf(disc_loss_weighted)
+                accelerator.backward(disc_loss_weighted)
+                # Check NaN across all ranks (all-reduce max so one NaN → all skip)
+                disc_nan_flag = torch.tensor(
+                    1.0 if (torch.isnan(disc_loss_weighted) or torch.isinf(disc_loss_weighted)) else 0.0,
+                    device=accelerator.device,
+                )
+                disc_nan_flag = accelerator.gather(disc_nan_flag).max()
+                disc_is_nan = disc_nan_flag.item() > 0.5
                 if not disc_is_nan:
-                    accelerator.backward(disc_loss_weighted)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(discriminator.parameters(), training_args.max_grad_norm)
                     disc_optimizer.step()
@@ -1780,8 +1793,8 @@ def main():
                 _, fmaps_target = discriminator(target_waveform)
                 discriminator_candidate, fmaps_candidate = discriminator(model_outputs.waveform)
 
-                loss_duration = torch.sum(model_outputs.log_duration)
-                loss_mel = torch.nn.functional.l1_loss(mel_scaled_target, mel_scaled_generation)
+                loss_duration = torch.sum(model_outputs.log_duration.float())
+                loss_mel = torch.nn.functional.l1_loss(mel_scaled_target.float(), mel_scaled_generation.float())
                 loss_kl = kl_loss(
                     model_outputs.prior_latents,
                     model_outputs.posterior_log_variances,
@@ -1800,26 +1813,33 @@ def main():
                     + loss_gen * training_args.weight_gen
                 )
 
-                # backpropagate generator with NaN protection
-                gen_is_nan = torch.isnan(total_generator_loss) or torch.isinf(total_generator_loss)
+                # backpropagate generator — always call backward for NCCL sync
+                accelerator.backward(total_generator_loss)
+                # Check NaN across all ranks
+                gen_nan_flag = torch.tensor(
+                    1.0 if (torch.isnan(total_generator_loss) or torch.isinf(total_generator_loss)) else 0.0,
+                    device=accelerator.device,
+                )
+                gen_nan_flag = accelerator.gather(gen_nan_flag).max()
+                gen_is_nan = gen_nan_flag.item() > 0.5
                 if not gen_is_nan:
                     nan_count = 0
-                    accelerator.backward(total_generator_loss)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
                     gen_optimizer.step()
                 else:
                     nan_count += 1
-                    logger.warning(
-                        "Step %d: NaN/Inf in generator loss (consecutive=%d) — skipping gen update. "
-                        "Components: dur=%.4g mel=%.4g kl=%.4g fmap=%.4g gen=%.4g",
-                        global_step, nan_count,
-                        loss_duration.item() if not torch.isnan(loss_duration) else float("nan"),
-                        loss_mel.item() if not torch.isnan(loss_mel) else float("nan"),
-                        loss_kl.item() if not torch.isnan(loss_kl) else float("nan"),
-                        loss_fmaps.item() if not torch.isnan(loss_fmaps) else float("nan"),
-                        loss_gen.item() if not torch.isnan(loss_gen) else float("nan"),
-                    )
+                    if accelerator.is_main_process:
+                        logger.warning(
+                            "Step %d: NaN/Inf in generator loss (consecutive=%d) — skipping gen update. "
+                            "Components: dur=%.4g mel=%.4g kl=%.4g fmap=%.4g gen=%.4g",
+                            global_step, nan_count,
+                            loss_duration.item() if not torch.isnan(loss_duration) else float("nan"),
+                            loss_mel.item() if not torch.isnan(loss_mel) else float("nan"),
+                            loss_kl.item() if not torch.isnan(loss_kl) else float("nan"),
+                            loss_fmaps.item() if not torch.isnan(loss_fmaps) else float("nan"),
+                            loss_gen.item() if not torch.isnan(loss_gen) else float("nan"),
+                        )
                     if nan_count >= max_consecutive_nan:
                         logger.error("Aborting: %d consecutive NaN steps.", max_consecutive_nan)
                         stop_requested = True
