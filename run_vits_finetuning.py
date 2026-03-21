@@ -1346,6 +1346,7 @@ def main():
         batch[model_input_name] = string_inputs.get("input_ids")[: max_tokens_length + 1]
         batch["waveform_input_length"] = len(sample["array"])
         batch["tokens_input_length"] = len(batch[model_input_name])
+        batch["alignment_input_length"] = batch["waveform_input_length"] * max(batch["tokens_input_length"], 1)
         batch["waveform"] = batch[audio_column_name]["array"]
 
         batch["mel_scaled_input_features"] = audio_inputs.get("mel_scaled_input_features")[0]
@@ -1548,7 +1549,12 @@ def main():
         model.gradient_checkpointing_enable()
 
     length_column_name = "tokens_input_length"
-    if training_args.use_optimized_dataloader and "waveform_input_length" in train_dataset.column_names:
+    if (
+        training_args.group_by_length
+        and "alignment_input_length" in train_dataset.column_names
+    ):
+        length_column_name = "alignment_input_length"
+    elif training_args.use_optimized_dataloader and "waveform_input_length" in train_dataset.column_names:
         length_column_name = "waveform_input_length"
     dataloader_num_workers = training_args.dataloader_num_workers
     dataloader_pin_memory = False
@@ -1875,6 +1881,7 @@ def main():
                 max_text_tokens = int(batch["attention_mask"].sum(-1).max().item())
                 max_mel_frames = int(batch["labels_attention_mask"].sum(-1).max().item())
                 max_waveform_samples = int(batch["waveform"].shape[1])
+                max_alignment_cost = int(max_text_tokens * max_mel_frames)
                 speaker_summary = ""
                 if "speaker_id" in batch and batch["speaker_id"] is not None:
                     speaker_summary = ", speaker_id_range=%s-%s" % (
@@ -1882,12 +1889,13 @@ def main():
                         int(batch["speaker_id"].max().item()),
                     )
                 logger.warning(
-                    "Rank %s first train batch: batch_size=%s, max_text_tokens=%s, max_mel_frames=%s, max_waveform_samples=%s",
+                    "Rank %s first train batch: batch_size=%s, max_text_tokens=%s, max_mel_frames=%s, max_waveform_samples=%s, approx_alignment_cost=%s",
                     accelerator.process_index,
                     local_batch_size,
                     max_text_tokens,
                     max_mel_frames,
                     max_waveform_samples,
+                    max_alignment_cost,
                 )
                 if speaker_summary:
                     logger.warning("Rank %s first train batch details:%s", accelerator.process_index, speaker_summary)
