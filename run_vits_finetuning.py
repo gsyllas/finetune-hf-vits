@@ -1471,6 +1471,12 @@ def main():
         training_args.group_by_length,
         length_column_name,
     )
+    if accelerator.num_processes > 1 and training_args.group_by_length:
+        logger.warning(
+            "group_by_length=True with Accelerate multi-process training can create very uneven per-rank batches. "
+            "If training stalls at step 0 or times out in NCCL collectives, try group_by_length=False, "
+            "use_optimized_dataloader=False, a smaller per_device_train_batch_size, or lower max_duration_in_seconds/max_tokens_length."
+        )
 
     # 12. Define train_dataloader and eval_dataloader if relevant
     train_dataloader = None
@@ -1731,6 +1737,23 @@ def main():
                 gen_optimizer.param_groups[0]["lr"] = 0.0
 
         for step, batch in enumerate(train_dataloader):
+            if (
+                accelerator.num_processes > 1
+                and training_args.group_by_length
+                and epoch == first_epoch
+                and step == 0
+            ):
+                max_text_tokens = int(batch["attention_mask"].sum(-1).max().item())
+                max_mel_frames = int(batch["labels_attention_mask"].sum(-1).max().item())
+                max_waveform_samples = int(batch["waveform"].shape[1])
+                logger.warning(
+                    "Rank %s first train batch: batch_size=%s, max_text_tokens=%s, max_mel_frames=%s, max_waveform_samples=%s",
+                    accelerator.process_index,
+                    int(batch["input_ids"].shape[0]),
+                    max_text_tokens,
+                    max_mel_frames,
+                    max_waveform_samples,
+                )
             with accelerator.accumulate(model, discriminator):
                 # forward through model
                 model_outputs = model(
