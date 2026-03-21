@@ -1,9 +1,9 @@
 {
-    "project_name": "mms_greek_multispeaker_from_scratch_stable_4gpu",
+    "project_name": "mms_greek_multispeaker_from_scratch_stable_fast_4gpu",
     "push_to_hub": false,
     "report_to": ["wandb"],
     "overwrite_output_dir": false,
-    "output_dir": "/leonardo_work/EUHPC_D29_081/gsyllas0/output/vits_from_scratch_greek_multispeaker_stable_4gpu",
+    "output_dir": "/leonardo_work/EUHPC_D29_081/gsyllas0/output/vits_from_scratch_greek_multispeaker_stable_fast_4gpu",
 
     "dataset_name": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/multi_speaker_combined",
     "audio_column_name": "audio",
@@ -22,19 +22,19 @@
 
     "full_generation_sample_text": "Καλημέρα, πώς είσαι σήμερα;",
 
-    "max_duration_in_seconds": 15,
+    "max_duration_in_seconds": 20,
     "min_duration_in_seconds": 1.0,
-    "max_tokens_length": 300,
+    "max_tokens_length": 350,
 
     "preprocessing_num_workers": 4,
-    "dataloader_num_workers": 4,
-    "use_optimized_dataloader": true,
+    "dataloader_num_workers": 2,
+    "use_optimized_dataloader": false,
 
     "do_train": true,
     "num_train_epochs": 120,
-    "gradient_accumulation_steps": 1,
+    "gradient_accumulation_steps": 2,
     "gradient_checkpointing": false,
-    "per_device_train_batch_size": 32,
+    "per_device_train_batch_size": 16,
     "learning_rate": 0.00015,
     "adam_beta1": 0.8,
     "adam_beta2": 0.99,
@@ -42,14 +42,14 @@
     "lr_scheduler_type": "linear",
     "do_step_schedule_per_epoch": false,
     "max_grad_norm": 0.5,
-    "group_by_length": true,
+    "group_by_length": false,
 
     "save_steps": 500,
     "save_total_limit": 10,
 
     "do_eval": true,
     "eval_steps": 1000,
-    "per_device_eval_batch_size": 8,
+    "per_device_eval_batch_size": 16,
     "max_eval_samples": 25,
 
     "weight_disc": 3,
