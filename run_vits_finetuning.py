@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -555,6 +556,113 @@ def clear_timeout_resume_request(output_dir: str) -> None:
     request_path = get_timeout_resume_request_path(output_dir)
     if os.path.exists(request_path):
         os.remove(request_path)
+
+
+def get_length_grouped_indices(
+    lengths: List[int],
+    batch_size: int,
+    mega_batch_mult: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+) -> List[int]:
+    """Lightweight local copy of the HF helper so we can rebalance per-rank batches."""
+    if mega_batch_mult is None:
+        mega_batch_mult = min(len(lengths) // (batch_size * 4), 50)
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+
+    indices = torch.randperm(len(lengths), generator=generator)
+    megabatch_size = mega_batch_mult * batch_size
+    megabatches = [indices[i : i + megabatch_size].tolist() for i in range(0, len(lengths), megabatch_size)]
+    megabatches = [list(sorted(megabatch, key=lambda i: lengths[i], reverse=True)) for megabatch in megabatches]
+    megabatch_maximums = [lengths[megabatch[0]] for megabatch in megabatches]
+    max_idx = torch.argmax(torch.tensor(megabatch_maximums)).item()
+    megabatches[0][0], megabatches[max_idx][0] = megabatches[max_idx][0], megabatches[0][0]
+
+    return sum(megabatches, [])
+
+
+class ProcessBalancedLengthGroupedSampler(torch.utils.data.Sampler[int]):
+    """
+    Arrange indices so Accelerate's batch-level sharding sees similarly heavy batches on each rank.
+
+    We keep the sampler process-agnostic: every process builds the same global ordering locally and
+    Accelerate then shards batches across processes.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        world_size: int,
+        lengths: Optional[List[int]] = None,
+        seed: int = 0,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.world_size = world_size
+        self.seed = seed
+        self.epoch = 0
+        if lengths is None:
+            if not isinstance(dataset[0], dict) or "input_ids" not in dataset[0]:
+                raise ValueError(
+                    "Can only automatically infer lengths for datasets whose items are dictionaries with an "
+                    "'input_ids' key."
+                )
+            lengths = [len(feature["input_ids"]) for feature in dataset]
+        self.lengths = lengths
+
+    def __len__(self):
+        return len(self.lengths)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        global_batch_size = self.batch_size * self.world_size
+        grouped_indices = get_length_grouped_indices(self.lengths, global_batch_size, generator=generator)
+
+        balanced_indices: List[int] = []
+        for start_idx in range(0, len(grouped_indices), global_batch_size):
+            chunk = grouped_indices[start_idx : start_idx + global_batch_size]
+            if len(chunk) <= self.batch_size or self.world_size <= 1:
+                balanced_indices.extend(chunk)
+                continue
+
+            per_rank_batches: List[List[int]] = [[] for _ in range(self.world_size)]
+            per_rank_costs = [0 for _ in range(self.world_size)]
+
+            for sample_idx in chunk:
+                candidate_ranks = [rank for rank, rank_batch in enumerate(per_rank_batches) if len(rank_batch) < self.batch_size]
+                if not candidate_ranks:
+                    break
+
+                target_rank = min(candidate_ranks, key=lambda rank: (per_rank_costs[rank], len(per_rank_batches[rank])))
+                per_rank_batches[target_rank].append(sample_idx)
+                per_rank_costs[target_rank] += int(self.lengths[sample_idx])
+
+            for rank_batch in per_rank_batches:
+                balanced_indices.extend(rank_batch)
+
+        return iter(balanced_indices)
+
+
+def synchronize_accelerator_device(accelerator: Accelerator) -> None:
+    if accelerator.device.type == "cuda":
+        torch.cuda.synchronize(accelerator.device)
+
+
+def log_first_step_phase(accelerator: Accelerator, phase: str, duration_seconds: Optional[float] = None) -> None:
+    if duration_seconds is None:
+        logger.warning("Rank %s first step entering %s", accelerator.process_index, phase)
+    else:
+        logger.warning(
+            "Rank %s first step finished %s in %.2fs",
+            accelerator.process_index,
+            phase,
+            duration_seconds,
+        )
 
 
 def save_training_checkpoint(accelerator: Accelerator, training_args: "VITSTrainingArguments", global_step: int) -> str:
@@ -1472,24 +1580,36 @@ def main():
         length_column_name,
     )
     if accelerator.num_processes > 1 and training_args.group_by_length:
+        logger.info(
+            "group_by_length=True with multi-process training will use a process-balanced sampler on %s processes.",
+            accelerator.num_processes,
+        )
+    elif accelerator.num_processes > 1:
         logger.warning(
-            "group_by_length=True with Accelerate multi-process training can create very uneven per-rank batches. "
-            "If training stalls at step 0 or times out in NCCL collectives, try group_by_length=False, "
-            "use_optimized_dataloader=False, a smaller per_device_train_batch_size, or lower max_duration_in_seconds/max_tokens_length."
+            "group_by_length=False means each rank can still receive a very different first batch. "
+            "If step 0 stalls before an NCCL timeout, try group_by_length=True, a smaller per_device_train_batch_size, "
+            "or lower max_duration_in_seconds/max_tokens_length."
         )
 
     # 12. Define train_dataloader and eval_dataloader if relevant
     train_dataloader = None
     if training_args.do_train:
-        sampler = (
-            LengthGroupedSampler(
-                batch_size=per_device_train_batch_size,
-                dataset=train_dataset,
-                lengths=train_dataset[length_column_name],
-            )
-            if training_args.group_by_length
-            else None
-        )
+        sampler = None
+        if training_args.group_by_length:
+            if accelerator.num_processes > 1:
+                sampler = ProcessBalancedLengthGroupedSampler(
+                    batch_size=per_device_train_batch_size,
+                    dataset=train_dataset,
+                    world_size=accelerator.num_processes,
+                    lengths=train_dataset[length_column_name],
+                    seed=training_args.seed,
+                )
+            else:
+                sampler = LengthGroupedSampler(
+                    batch_size=per_device_train_batch_size,
+                    dataset=train_dataset,
+                    lengths=train_dataset[length_column_name],
+                )
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             shuffle=not training_args.group_by_length,
@@ -1500,15 +1620,22 @@ def main():
 
     eval_dataloader = None
     if training_args.do_eval:
-        eval_sampler = (
-            LengthGroupedSampler(
-                batch_size=training_args.per_device_eval_batch_size,
-                dataset=eval_dataset,
-                lengths=eval_dataset[length_column_name],
-            )
-            if training_args.group_by_length
-            else None
-        )
+        eval_sampler = None
+        if training_args.group_by_length:
+            if accelerator.num_processes > 1:
+                eval_sampler = ProcessBalancedLengthGroupedSampler(
+                    batch_size=training_args.per_device_eval_batch_size,
+                    dataset=eval_dataset,
+                    world_size=accelerator.num_processes,
+                    lengths=eval_dataset[length_column_name],
+                    seed=training_args.seed + 1,
+                )
+            else:
+                eval_sampler = LengthGroupedSampler(
+                    batch_size=training_args.per_device_eval_batch_size,
+                    dataset=eval_dataset,
+                    lengths=eval_dataset[length_column_name],
+                )
 
         eval_dataloader = torch.utils.data.DataLoader(
             eval_dataset,
@@ -1714,6 +1841,11 @@ def main():
     nan_count = 0
     max_consecutive_nan = 50  # abort if NaN persists this many steps
     for epoch in range(first_epoch, training_args.num_train_epochs):
+        if hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(epoch)
+        if eval_dataloader is not None and hasattr(eval_dataloader, "set_epoch"):
+            eval_dataloader.set_epoch(epoch)
+
         # Unfreeze backbone after freeze_backbone_epochs by restoring its LR
         if not backbone_unfrozen and epoch >= freeze_backbone_epochs:
             backbone_unfrozen = True
@@ -1737,24 +1869,33 @@ def main():
                 gen_optimizer.param_groups[0]["lr"] = 0.0
 
         for step, batch in enumerate(train_dataloader):
-            if (
-                accelerator.num_processes > 1
-                and training_args.group_by_length
-                and epoch == first_epoch
-                and step == 0
-            ):
+            first_step_debug = accelerator.num_processes > 1 and epoch == first_epoch and step == 0
+            local_batch_size = int(batch["input_ids"].shape[0])
+            if first_step_debug:
                 max_text_tokens = int(batch["attention_mask"].sum(-1).max().item())
                 max_mel_frames = int(batch["labels_attention_mask"].sum(-1).max().item())
                 max_waveform_samples = int(batch["waveform"].shape[1])
+                speaker_summary = ""
+                if "speaker_id" in batch and batch["speaker_id"] is not None:
+                    speaker_summary = ", speaker_id_range=%s-%s" % (
+                        int(batch["speaker_id"].min().item()),
+                        int(batch["speaker_id"].max().item()),
+                    )
                 logger.warning(
                     "Rank %s first train batch: batch_size=%s, max_text_tokens=%s, max_mel_frames=%s, max_waveform_samples=%s",
                     accelerator.process_index,
-                    int(batch["input_ids"].shape[0]),
+                    local_batch_size,
                     max_text_tokens,
                     max_mel_frames,
                     max_waveform_samples,
                 )
+                if speaker_summary:
+                    logger.warning("Rank %s first train batch details:%s", accelerator.process_index, speaker_summary)
             with accelerator.accumulate(model, discriminator):
+                if first_step_debug:
+                    synchronize_accelerator_device(accelerator)
+                    phase_start = time.perf_counter()
+                    log_first_step_phase(accelerator, "model forward")
                 # forward through model
                 model_outputs = model(
                     input_ids=batch["input_ids"],
@@ -1765,6 +1906,12 @@ def main():
                     return_dict=True,
                     monotonic_alignment_function=maximum_path,
                 )
+                if first_step_debug:
+                    synchronize_accelerator_device(accelerator)
+                    log_first_step_phase(accelerator, "model forward", time.perf_counter() - phase_start)
+                    synchronize_accelerator_device(accelerator)
+                    phase_start = time.perf_counter()
+                    log_first_step_phase(accelerator, "mel/discriminator prep")
 
                 mel_scaled_labels = batch["mel_scaled_input_features"]
                 mel_scaled_target = slice_segments(mel_scaled_labels, model_outputs.ids_slice, model_segment_size)
@@ -1776,6 +1923,12 @@ def main():
                 target_waveform = slice_segments(
                     target_waveform, model_outputs.ids_slice * feature_extractor.hop_length, config_segment_size
                 )
+                if first_step_debug:
+                    synchronize_accelerator_device(accelerator)
+                    log_first_step_phase(accelerator, "mel/discriminator prep", time.perf_counter() - phase_start)
+                    synchronize_accelerator_device(accelerator)
+                    phase_start = time.perf_counter()
+                    log_first_step_phase(accelerator, "discriminator forward/backward")
 
                 # -----------------------
                 #  Train Discriminator
@@ -1792,12 +1945,18 @@ def main():
                 # NCCL collectives in sync across ranks; skip optimizer.step on NaN.
                 disc_loss_weighted = loss_disc * training_args.weight_disc
                 accelerator.backward(disc_loss_weighted)
+                if first_step_debug:
+                    synchronize_accelerator_device(accelerator)
+                    log_first_step_phase(accelerator, "discriminator forward/backward", time.perf_counter() - phase_start)
+                    logger.warning("Rank %s first step entering discriminator NaN sync", accelerator.process_index)
                 # Check NaN across all ranks (all-reduce max so one NaN → all skip)
                 disc_nan_flag = torch.tensor(
                     1.0 if (torch.isnan(disc_loss_weighted) or torch.isinf(disc_loss_weighted)) else 0.0,
                     device=accelerator.device,
                 )
                 disc_nan_flag = accelerator.gather(disc_nan_flag).max()
+                if first_step_debug:
+                    logger.warning("Rank %s first step finished discriminator NaN sync", accelerator.process_index)
                 disc_is_nan = disc_nan_flag.item() > 0.5
                 if not disc_is_nan:
                     if accelerator.sync_gradients:
@@ -1837,13 +1996,23 @@ def main():
                 )
 
                 # backpropagate generator — always call backward for NCCL sync
+                if first_step_debug:
+                    synchronize_accelerator_device(accelerator)
+                    phase_start = time.perf_counter()
+                    log_first_step_phase(accelerator, "generator backward")
                 accelerator.backward(total_generator_loss)
+                if first_step_debug:
+                    synchronize_accelerator_device(accelerator)
+                    log_first_step_phase(accelerator, "generator backward", time.perf_counter() - phase_start)
+                    logger.warning("Rank %s first step entering generator NaN sync", accelerator.process_index)
                 # Check NaN across all ranks
                 gen_nan_flag = torch.tensor(
                     1.0 if (torch.isnan(total_generator_loss) or torch.isinf(total_generator_loss)) else 0.0,
                     device=accelerator.device,
                 )
                 gen_nan_flag = accelerator.gather(gen_nan_flag).max()
+                if first_step_debug:
+                    logger.warning("Rank %s first step finished generator NaN sync", accelerator.process_index)
                 gen_is_nan = gen_nan_flag.item() > 0.5
                 if not gen_is_nan:
                     nan_count = 0
@@ -1887,7 +2056,11 @@ def main():
                         loss_fake_disc,
                     ]
                 )
-                losses = accelerator.gather(losses.repeat(per_device_train_batch_size, 1)).mean(0)
+                if first_step_debug:
+                    logger.warning("Rank %s first step entering train loss gather", accelerator.process_index)
+                losses = accelerator.gather(losses.repeat(local_batch_size, 1)).mean(0)
+                if first_step_debug:
+                    logger.warning("Rank %s first step finished train loss gather", accelerator.process_index)
 
                 train_losses = [
                     l + losses[i].item() / training_args.gradient_accumulation_steps
@@ -2000,7 +2173,7 @@ def main():
                             model_outputs_train,
                             mel_scaled_generation,
                             mel_scaled_target,
-                            per_device_train_batch_size,
+                            int(batch["input_ids"].shape[0]),
                             compute_clap_similarity=False,
                         )
 
@@ -2128,7 +2301,7 @@ def main():
                         model_outputs_train,
                         mel_scaled_generation,
                         mel_scaled_target,
-                        per_device_train_batch_size,
+                        int(batch["input_ids"].shape[0]),
                         compute_clap_similarity=False,
                     )
                 specs = feature_extractor._torch_extract_fbank_features(model_outputs_train.waveform.squeeze(1))[0]
