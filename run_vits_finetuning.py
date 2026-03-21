@@ -1846,6 +1846,13 @@ def main():
     stop_requested = False
     nan_count = 0
     max_consecutive_nan = 50  # abort if NaN persists this many steps
+
+    # Synchronize all ranks before entering the training loop so no rank is
+    # delayed by tracker init / checkpoint loading / filesystem I/O.
+    logger.warning("Rank %s waiting at pre-training barrier", accelerator.process_index)
+    accelerator.wait_for_everyone()
+    logger.warning("Rank %s passed pre-training barrier, entering epoch loop", accelerator.process_index)
+
     for epoch in range(first_epoch, training_args.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -1874,10 +1881,18 @@ def main():
             if not backbone_unfrozen:
                 gen_optimizer.param_groups[0]["lr"] = 0.0
 
+        if accelerator.num_processes > 1 and epoch == first_epoch:
+            logger.warning("Rank %s entering first dataloader iteration", accelerator.process_index)
+            _dl_start = time.perf_counter()
+
         for step, batch in enumerate(train_dataloader):
             first_step_debug = accelerator.num_processes > 1 and epoch == first_epoch and step == 0
             local_batch_size = int(batch["input_ids"].shape[0])
             if first_step_debug:
+                logger.warning(
+                    "Rank %s got first batch from dataloader in %.2fs",
+                    accelerator.process_index, time.perf_counter() - _dl_start,
+                )
                 max_text_tokens = int(batch["attention_mask"].sum(-1).max().item())
                 max_mel_frames = int(batch["labels_attention_mask"].sum(-1).max().item())
                 max_waveform_samples = int(batch["waveform"].shape[1])
@@ -1901,6 +1916,11 @@ def main():
                     logger.warning("Rank %s first train batch details:%s", accelerator.process_index, speaker_summary)
             with accelerator.accumulate(model, discriminator):
                 if first_step_debug:
+                    # Barrier so all ranks start the first forward pass together —
+                    # rules out dataloader / tracker-init skew as the hang cause.
+                    logger.warning("Rank %s waiting at pre-forward barrier", accelerator.process_index)
+                    torch.distributed.barrier()
+                    logger.warning("Rank %s passed pre-forward barrier", accelerator.process_index)
                     synchronize_accelerator_device(accelerator)
                     phase_start = time.perf_counter()
                     log_first_step_phase(accelerator, "model forward")
@@ -1962,7 +1982,7 @@ def main():
                     1.0 if (torch.isnan(disc_loss_weighted) or torch.isinf(disc_loss_weighted)) else 0.0,
                     device=accelerator.device,
                 )
-                disc_nan_flag = accelerator.gather(disc_nan_flag).max()
+                torch.distributed.all_reduce(disc_nan_flag, op=torch.distributed.ReduceOp.MAX)
                 if first_step_debug:
                     logger.warning("Rank %s first step finished discriminator NaN sync", accelerator.process_index)
                 disc_is_nan = disc_nan_flag.item() > 0.5
@@ -2018,7 +2038,7 @@ def main():
                     1.0 if (torch.isnan(total_generator_loss) or torch.isinf(total_generator_loss)) else 0.0,
                     device=accelerator.device,
                 )
-                gen_nan_flag = accelerator.gather(gen_nan_flag).max()
+                torch.distributed.all_reduce(gen_nan_flag, op=torch.distributed.ReduceOp.MAX)
                 if first_step_debug:
                     logger.warning("Rank %s first step finished generator NaN sync", accelerator.process_index)
                 gen_is_nan = gen_nan_flag.item() > 0.5
