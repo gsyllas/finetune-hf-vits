@@ -45,7 +45,7 @@ if is_wandb_available():
     import wandb
 
 
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
 logger = logging.getLogger(__name__)
 TIMEOUT_RESUME_REQUEST_FILENAME = ".slurm_resume_requested"
 
@@ -1916,11 +1916,6 @@ def main():
                     logger.warning("Rank %s first train batch details:%s", accelerator.process_index, speaker_summary)
             with accelerator.accumulate(model, discriminator):
                 if first_step_debug:
-                    # Barrier so all ranks start the first forward pass together —
-                    # rules out dataloader / tracker-init skew as the hang cause.
-                    logger.warning("Rank %s waiting at pre-forward barrier", accelerator.process_index)
-                    torch.distributed.barrier()
-                    logger.warning("Rank %s passed pre-forward barrier", accelerator.process_index)
                     synchronize_accelerator_device(accelerator)
                     phase_start = time.perf_counter()
                     log_first_step_phase(accelerator, "model forward")
