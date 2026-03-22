@@ -1847,11 +1847,12 @@ def main():
     nan_count = 0
     max_consecutive_nan = 50  # abort if NaN persists this many steps
 
-    # Synchronize all ranks before entering the training loop so no rank is
-    # delayed by tracker init / checkpoint loading / filesystem I/O.
-    logger.warning("Rank %s waiting at pre-training barrier", accelerator.process_index)
-    accelerator.wait_for_everyone()
-    logger.warning("Rank %s passed pre-training barrier, entering epoch loop", accelerator.process_index)
+    if accelerator.num_processes > 1:
+        # Synchronize all ranks before entering the training loop so no rank is
+        # delayed by tracker init / checkpoint loading / filesystem I/O.
+        logger.warning("Rank %s waiting at pre-training barrier", accelerator.process_index)
+        accelerator.wait_for_everyone()
+        logger.warning("Rank %s passed pre-training barrier, entering epoch loop", accelerator.process_index)
 
     for epoch in range(first_epoch, training_args.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
@@ -1874,19 +1875,12 @@ def main():
         # keep track of train losses
         train_losses = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        if training_args.do_step_schedule_per_epoch:
-            disc_lr_scheduler.step()
-            gen_lr_scheduler.step()
-            # During freeze, override backbone lr back to 0 after scheduler step
-            if not backbone_unfrozen:
-                gen_optimizer.param_groups[0]["lr"] = 0.0
-
-        if accelerator.num_processes > 1 and epoch == first_epoch:
+        if epoch == first_epoch:
             logger.warning("Rank %s entering first dataloader iteration", accelerator.process_index)
             _dl_start = time.perf_counter()
 
         for step, batch in enumerate(train_dataloader):
-            first_step_debug = accelerator.num_processes > 1 and epoch == first_epoch and step == 0
+            first_step_debug = epoch == first_epoch and step == 0
             local_batch_size = int(batch["input_ids"].shape[0])
             if first_step_debug:
                 logger.warning(
@@ -2270,6 +2264,13 @@ def main():
                     logger.info("Validation finished... ")
 
                 accelerator.wait_for_everyone()
+
+        if training_args.do_step_schedule_per_epoch:
+            disc_lr_scheduler.step()
+            gen_lr_scheduler.step()
+            # During freeze, override backbone lr back to 0 after the per-epoch scheduler step.
+            if not backbone_unfrozen:
+                gen_optimizer.param_groups[0]["lr"] = 0.0
 
         if stop_requested:
             logger.info("Stopping training early after handling a timeout resume request.")

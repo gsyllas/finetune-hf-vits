@@ -2189,7 +2189,9 @@ class VitsModelForPreTraining(VitsPreTrainedModel):
             # negative cross-entropy
 
             # [batch_size, d, latent_length]
-            prior_variances = torch.exp(-2 * prior_log_variances)
+            # Clamp to prevent exp() overflow with randomly-initialised weights (from-scratch).
+            # -2 * log_var > ~88 overflows float32; in bf16 the threshold is even lower.
+            prior_variances = torch.exp(torch.clamp(-2 * prior_log_variances, max=80.0))
             # [batch_size, 1, latent_length]
             neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - prior_log_variances, [1], keepdim=True)
             # [batch_size, text_length, d] x [batch_size, d, latent_length] = [batch_size, text_length, latent_length]
@@ -2201,6 +2203,9 @@ class VitsModelForPreTraining(VitsPreTrainedModel):
 
             # [batch_size, text_length, latent_length]
             neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+            # Replace NaN/Inf with large negative values so the CPU alignment
+            # does not stall on pathological float comparisons.
+            neg_cent = torch.nan_to_num(neg_cent, nan=-1e4, posinf=-1e4, neginf=-1e4)
 
             attn_mask = torch.unsqueeze(input_padding_mask, 2) * torch.unsqueeze(labels_padding_mask, -1)
 
