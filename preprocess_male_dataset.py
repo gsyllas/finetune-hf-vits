@@ -238,6 +238,7 @@ def main(args: argparse.Namespace) -> None:
     skipped_missing = 0
     skipped_empty = 0
 
+    skipped_oov = 0
     for row in rows:
         wav_name = os.path.basename(row["file_name"].strip())
         wav_path = os.path.join(args.audio_dir, wav_name)
@@ -250,9 +251,13 @@ def main(args: argparse.Namespace) -> None:
             skipped_empty += 1
             continue
 
-        normalized_text, _ = normalize(original_text)
+        normalized_text, oov_chars = normalize(original_text)
         if not normalized_text:
             skipped_empty += 1
+            continue
+
+        if oov_chars:
+            skipped_oov += 1
             continue
 
         audio_paths.append(wav_path)
@@ -268,6 +273,7 @@ def main(args: argparse.Namespace) -> None:
     print(f"Saved {len(audio_paths)} samples to {args.output_dir}")
     print(f"Skipped {skipped_missing} rows with missing wav file")
     print(f"Skipped {skipped_empty} rows with empty/blank transcription")
+    print(f"Skipped {skipped_oov} rows with out-of-vocab non-punctuation characters")
     print(f"Sample: {texts[0]}")
 
 
