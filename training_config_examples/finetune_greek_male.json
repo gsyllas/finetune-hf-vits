@@ -2,7 +2,7 @@
     "project_name": "single_speaker_male_mms_finetuning",
     "push_to_hub": false,
     "report_to": ["wandb"],
-    "overwrite_output_dir": true,
+    "overwrite_output_dir": false,
     "output_dir": "/leonardo_work/EUHPC_D29_081/gsyllas0/output/single_speaker_male_mms_finetuning",
 
     "dataset_name": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/male_vits",
