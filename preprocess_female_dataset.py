@@ -125,8 +125,8 @@ def main(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"metadata.csv not found in {args.dataset_root}")
 
     rows = []
-    with open(csv_path, "r", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter="|")
+    with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=",")
         for row in reader:
             rows.append(row)
 
@@ -145,8 +145,8 @@ def main(args: argparse.Namespace) -> None:
 
         print("Reading wav headers for duration stats (this may take a moment)...")
         for row in rows:
-            wav_path = os.path.join(args.dataset_root, row["filename"].strip())
-            original_text = row["transcription"].strip()
+            wav_path = os.path.join(args.dataset_root, row["filename"].strip().rstrip("\r"))
+            original_text = row["transcription"].strip().rstrip("\r")
 
             if not os.path.exists(wav_path):
                 skipped_missing += 1
@@ -242,8 +242,8 @@ def main(args: argparse.Namespace) -> None:
     skipped_oov = 0
 
     for row in rows:
-        wav_path = os.path.join(args.dataset_root, row["filename"].strip())
-        original_text = row["transcription"].strip()
+        wav_path = os.path.join(args.dataset_root, row["filename"].strip().rstrip("\r"))
+        original_text = row["transcription"].strip().rstrip("\r")
 
         if not os.path.exists(wav_path):
             skipped_missing += 1
