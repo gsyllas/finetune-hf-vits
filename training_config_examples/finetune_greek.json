@@ -5,7 +5,7 @@
     "overwrite_output_dir": false,
     "output_dir": "/leonardo_work/EUHPC_D29_081/gsyllas0/output/single_speaker_female_mms_finetuning",
 
-    "dataset_name": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/female_vits_gsyllas",
+    "dataset_name": "/leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/female_vits_gsyllas_finetune",
     "audio_column_name": "audio",
     "text_column_name": "text",
     "train_split_name": "train",

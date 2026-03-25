@@ -39,7 +39,7 @@ export TRANSFORMERS_OFFLINE=1
 
 # Copy dataset and model to fast local storage
 echo "Copying data to local SSD..."
-cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/female_vits $TMPDIR/female_vits
+cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/data/tts/female_vits_gsyllas_finetune $TMPDIR/female_vits_gsyllas_finetune
 cp -r /leonardo_work/EUHPC_D29_081/gsyllas0/models/mms-tts-ell-train $TMPDIR/mms-tts-ell-train
 echo "Copy done."
 
